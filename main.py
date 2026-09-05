@@ -75,6 +75,14 @@ from actions.proactive         import ProactiveEngine
 from actions.background_monitor import (
     add_monitor, remove_monitor, list_monitors, check_all as monitor_check_all,
 )
+from actions.spotify_control   import spotify_control
+from actions.home_assistant    import home_assistant
+from actions.todoist_control   import todoist_control
+from actions.apple_notes       import apple_notes
+from actions.apple_native      import apple_native
+from actions.public_data       import public_data
+from actions.google_calendar   import google_calendar
+from actions.gmail_control     import gmail_control
 from actions.web_search        import _news as _fetch_news_sync
 from memory.config_manager     import (
     get_brief_enabled, get_voice, get_input_device, get_output_device,
@@ -514,6 +522,184 @@ TOOL_DECLARATIONS = [
             },
             "required": ["action"],
         },
+    },
+    {
+        "name": "spotify_control",
+        "description": (
+            "Controls Spotify: play/pause, next/previous track, search music, play a specific song, "
+            "set volume, get current track info, list playlists. "
+            "Use for ANY Spotify or music playback request."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "now_playing | play_pause | next_track | previous_track | search | play_track | set_volume | get_playlists"},
+                "query":  {"type": "STRING", "description": "Search query for search/play_track"},
+                "type":   {"type": "STRING", "description": "Search type: track | artist | album | playlist (default: track)"},
+                "volume": {"type": "INTEGER", "description": "Volume level 0-100 for set_volume"},
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "home_assistant",
+        "description": (
+            "Controls smart home devices via Home Assistant. "
+            "List devices, get state, turn on/off lights and switches, set brightness, set thermostat temperature. "
+            "Use for ANY smart home, IoT, or home automation request."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action":     {"type": "STRING", "description": "list_devices | get_state | turn_on | turn_off | set_brightness | set_temperature"},
+                "entity_id":  {"type": "STRING", "description": "Home Assistant entity ID (e.g. light.living_room)"},
+                "brightness": {"type": "INTEGER", "description": "Brightness 0-255 for set_brightness"},
+                "temperature": {"type": "NUMBER", "description": "Temperature for set_temperature"},
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "todoist_control",
+        "description": (
+            "Manages tasks via Todoist. List tasks, add new tasks with due dates and priorities, "
+            "mark tasks complete, list projects, search tasks. "
+            "Use for ANY task management, to-do list, or Todoist request."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action":       {"type": "STRING", "description": "get_tasks | add_task | complete_task | get_projects | search_tasks"},
+                "content":      {"type": "STRING", "description": "Task content/title for add_task"},
+                "due_string":   {"type": "STRING", "description": "Due date string (e.g. 'tomorrow', '2024-12-25') for add_task"},
+                "priority":     {"type": "INTEGER", "description": "Priority 1-4 (4=urgent) for add_task"},
+                "project_name": {"type": "STRING", "description": "Project name to filter by or add to"},
+                "task_id":      {"type": "STRING", "description": "Task ID for complete_task"},
+                "query":        {"type": "STRING", "description": "Search query or filter for search_tasks"},
+                "description":  {"type": "STRING", "description": "Task description for add_task"},
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "apple_notes",
+        "description": (
+            "Read, search, and create notes in Apple Notes (macOS only). "
+            "List recent notes, read note content, search across all notes, "
+            "create new notes, list folders. Use for ANY Apple Notes request."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "list_notes | read_note | search_notes | create_note | list_folders"},
+                "title":  {"type": "STRING", "description": "Note title for read_note or create_note"},
+                "body":   {"type": "STRING", "description": "Note body/content for create_note"},
+                "folder": {"type": "STRING", "description": "Folder name for list_notes or create_note"},
+                "query":  {"type": "STRING", "description": "Search query for search_notes"},
+                "limit":  {"type": "INTEGER", "description": "Max notes to list (default: 10)"},
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "apple_native",
+        "description": (
+            "Access macOS Calendar.app and Mail.app natively (no API key needed). "
+            "Calendar: list upcoming events, create events, search events. "
+            "Mail: read recent emails, count unread, search, create drafts (NEVER sends). "
+            "Use for native macOS calendar and email requests. "
+            "Prefer this over google_calendar/gmail_control when the user doesn't specify Google."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action":        {"type": "STRING", "description": "calendar_events | calendar_create | calendar_search | mail_recent | mail_unread | mail_search | mail_draft | mail_mailboxes"},
+                "days_ahead":    {"type": "INTEGER", "description": "Days ahead for calendar_events (default: 7)"},
+                "title":         {"type": "STRING", "description": "Event title for calendar_create"},
+                "start_date":    {"type": "STRING", "description": "Start date/time for calendar_create (YYYY-MM-DD HH:MM)"},
+                "end_date":      {"type": "STRING", "description": "End date/time for calendar_create (YYYY-MM-DD HH:MM)"},
+                "calendar_name": {"type": "STRING", "description": "Calendar name for calendar_create"},
+                "location":      {"type": "STRING", "description": "Event location for calendar_create"},
+                "notes":         {"type": "STRING", "description": "Event notes for calendar_create"},
+                "query":         {"type": "STRING", "description": "Search query for calendar_search or mail_search"},
+                "count":         {"type": "INTEGER", "description": "Number of emails for mail_recent (default: 10)"},
+                "to":            {"type": "STRING", "description": "Recipient email for mail_draft"},
+                "subject":       {"type": "STRING", "description": "Subject for mail_draft"},
+                "body":          {"type": "STRING", "description": "Body text for mail_draft"},
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "public_data",
+        "description": (
+            "Free public data lookups — NO API key needed. "
+            "Currency conversion, cryptocurrency prices, public holidays, "
+            "country info, IP geolocation, spaceflight news. "
+            "Use BEFORE web_search for these factual lookups — faster and more accurate."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action":        {"type": "STRING", "description": "currency | crypto | holidays | country | ip_geo | space_news"},
+                "amount":        {"type": "NUMBER", "description": "Amount for currency conversion"},
+                "from_currency": {"type": "STRING", "description": "Source currency code (e.g. USD, EUR)"},
+                "to_currency":   {"type": "STRING", "description": "Target currency code"},
+                "coin_id":       {"type": "STRING", "description": "Cryptocurrency ID (e.g. bitcoin, ethereum)"},
+                "country":       {"type": "STRING", "description": "Country name or code for holidays/country info"},
+                "year":          {"type": "INTEGER", "description": "Year for holidays (default: current year)"},
+                "ip":            {"type": "STRING", "description": "IP address for ip_geo (default: current IP)"},
+                "limit":         {"type": "INTEGER", "description": "Number of articles for space_news (default: 5)"},
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "google_calendar",
+        "description": (
+            "Full Google Calendar access via OAuth. List events, create events with "
+            "time/location/description, search events, delete events, list calendars. "
+            "Use when the user specifically asks about Google Calendar or needs OAuth-based calendar access."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action":      {"type": "STRING", "description": "list_events | create_event | search_events | delete_event | list_calendars"},
+                "days_ahead":  {"type": "INTEGER", "description": "Days ahead for list/search (default: 7)"},
+                "calendar_id": {"type": "STRING", "description": "Calendar ID (default: primary)"},
+                "summary":     {"type": "STRING", "description": "Event title for create_event"},
+                "start":       {"type": "STRING", "description": "Start datetime ISO format for create_event"},
+                "end":         {"type": "STRING", "description": "End datetime ISO format for create_event"},
+                "description": {"type": "STRING", "description": "Event description"},
+                "location":    {"type": "STRING", "description": "Event location"},
+                "query":       {"type": "STRING", "description": "Search query for search_events"},
+                "event_id":    {"type": "STRING", "description": "Event ID for delete_event"},
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "gmail_control",
+        "description": (
+            "Gmail access via OAuth (DRAFT-ONLY — never auto-sends). "
+            "Read inbox, count unread, read full emails, search with Gmail query syntax, "
+            "create email drafts, list labels. "
+            "Use when the user specifically asks about Gmail. "
+            "SAFETY: This tool can only create drafts, never send emails directly."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action":     {"type": "STRING", "description": "get_inbox | unread_count | read_email | search | create_draft | list_labels"},
+                "count":      {"type": "INTEGER", "description": "Number of emails for get_inbox (default: 10)"},
+                "message_id": {"type": "STRING", "description": "Message ID for read_email"},
+                "query":      {"type": "STRING", "description": "Gmail search query for search"},
+                "to":         {"type": "STRING", "description": "Recipient for create_draft"},
+                "subject":    {"type": "STRING", "description": "Subject for create_draft"},
+                "body":       {"type": "STRING", "description": "Body for create_draft"},
+            },
+            "required": ["action"]
+        }
     },
     {
         "name": "shutdown_jarvis",
@@ -1160,6 +1346,38 @@ class JarvisLive:
                     result = ("Monitoring: " + ", ".join(topics)) if topics else "No topics are being monitored."
                 else:
                     result = "Specify action (add/remove/list) and a topic."
+
+            elif name == "spotify_control":
+                r = await loop.run_in_executor(None, lambda: spotify_control(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "home_assistant":
+                r = await loop.run_in_executor(None, lambda: home_assistant(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "todoist_control":
+                r = await loop.run_in_executor(None, lambda: todoist_control(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "apple_notes":
+                r = await loop.run_in_executor(None, lambda: apple_notes(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "apple_native":
+                r = await loop.run_in_executor(None, lambda: apple_native(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "public_data":
+                r = await loop.run_in_executor(None, lambda: public_data(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "google_calendar":
+                r = await loop.run_in_executor(None, lambda: google_calendar(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "gmail_control":
+                r = await loop.run_in_executor(None, lambda: gmail_control(parameters=args, player=self.ui))
+                result = r or "Done."
 
             elif name == "shutdown_jarvis":
                 self.ui.write_log("SYS: Shutdown requested.")

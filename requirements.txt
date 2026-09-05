@@ -27,3 +27,8 @@ win10toast; sys_platform == "win32"
 pywinauto; sys_platform == "win32"
 pywin32; sys_platform == "win32"
 qrcode[pil]
+spotipy
+httpx
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
