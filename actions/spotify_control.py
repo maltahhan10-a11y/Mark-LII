@@ -67,6 +67,50 @@ def _get_spotify_client():
     return spotipy.Spotify(auth_manager=auth_manager)
 
 
+def _ensure_desktop_device(sp) -> str | None:
+    """Find the local Spotify desktop app and transfer playback to it.
+    Returns the device ID if found, None otherwise.
+    Prefers 'Computer' type devices over web players and phones."""
+    devices = sp.devices().get("devices", [])
+    if not devices:
+        return None
+
+    # Prefer Computer type (desktop app), then any non-web device
+    computer = next((d for d in devices if d.get("type") == "Computer"), None)
+    if computer:
+        dev_id = computer["id"]
+        # Transfer playback to desktop app if it isn't already active
+        if not computer.get("is_active"):
+            try:
+                sp.transfer_playback(device_id=dev_id, force_play=False)
+            except Exception:
+                pass
+        return dev_id
+
+    # No desktop app found — try to launch it on macOS
+    import platform
+    if platform.system() == "Darwin":
+        import subprocess
+        try:
+            subprocess.Popen(
+                ["open", "-a", "Spotify"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            import time
+            time.sleep(3)
+            devices = sp.devices().get("devices", [])
+            computer = next((d for d in devices if d.get("type") == "Computer"), None)
+            if computer:
+                return computer["id"]
+        except Exception:
+            pass
+
+    # Fall back to whatever is available
+    active = next((d for d in devices if d.get("is_active")), None)
+    return (active or devices[0])["id"] if devices else None
+
+
 def _log(message: str, player=None) -> None:
     print(f"[Spotify] {message}")
     if player:
@@ -114,18 +158,19 @@ def spotify_now_playing(parameters: dict, player=None) -> str:
 def spotify_play_pause(parameters: dict, player=None) -> str:
     """Toggle playback between play and pause."""
     sp = _get_spotify_client()
-    current = sp.current_playback()
+    dev_id = _ensure_desktop_device(sp)
 
-    if not current:
-        msg = "No active Spotify device found. Please open Spotify on a device first, sir."
+    if not dev_id:
+        msg = "No Spotify device found. Please open the Spotify desktop app, sir."
         _log(msg, player)
         return msg
 
-    if current.get("is_playing"):
-        sp.pause_playback()
+    current = sp.current_playback()
+    if current and current.get("is_playing"):
+        sp.pause_playback(device_id=dev_id)
         msg = "Spotify playback paused, sir."
     else:
-        sp.start_playback()
+        sp.start_playback(device_id=dev_id)
         msg = "Spotify playback resumed, sir."
 
     _log(msg, player)
@@ -135,14 +180,14 @@ def spotify_play_pause(parameters: dict, player=None) -> str:
 def spotify_next_track(parameters: dict, player=None) -> str:
     """Skip to the next track."""
     sp = _get_spotify_client()
-    current = sp.current_playback()
+    dev_id = _ensure_desktop_device(sp)
 
-    if not current:
-        msg = "No active Spotify device found. Please open Spotify on a device first, sir."
+    if not dev_id:
+        msg = "No Spotify device found. Please open the Spotify desktop app, sir."
         _log(msg, player)
         return msg
 
-    sp.next_track()
+    sp.next_track(device_id=dev_id)
     msg = "Skipped to the next track, sir."
     _log(msg, player)
     return msg
@@ -151,14 +196,14 @@ def spotify_next_track(parameters: dict, player=None) -> str:
 def spotify_previous_track(parameters: dict, player=None) -> str:
     """Go back to the previous track."""
     sp = _get_spotify_client()
-    current = sp.current_playback()
+    dev_id = _ensure_desktop_device(sp)
 
-    if not current:
-        msg = "No active Spotify device found. Please open Spotify on a device first, sir."
+    if not dev_id:
+        msg = "No Spotify device found. Please open the Spotify desktop app, sir."
         _log(msg, player)
         return msg
 
-    sp.previous_track()
+    sp.previous_track(device_id=dev_id)
     msg = "Went back to the previous track, sir."
     _log(msg, player)
     return msg
@@ -222,11 +267,10 @@ def spotify_play_track(parameters: dict, player=None) -> str:
         return msg
 
     sp = _get_spotify_client()
+    dev_id = _ensure_desktop_device(sp)
 
-    # Check for an active device first
-    current = sp.current_playback()
-    if not current and not sp.devices().get("devices"):
-        msg = "No active Spotify device found. Please open Spotify on a device first, sir."
+    if not dev_id:
+        msg = "No Spotify device found. Please open the Spotify desktop app, sir."
         _log(msg, player)
         return msg
 
@@ -243,7 +287,7 @@ def spotify_play_track(parameters: dict, player=None) -> str:
     track_name = track.get("name", "Unknown")
     artists = ", ".join(a["name"] for a in track.get("artists", []))
 
-    sp.start_playback(uris=[track_uri])
+    sp.start_playback(device_id=dev_id, uris=[track_uri])
     msg = f"Now playing \"{track_name}\" by {artists}, sir."
     _log(msg, player)
     return msg
@@ -268,14 +312,14 @@ def spotify_set_volume(parameters: dict, player=None) -> str:
     level = max(0, min(100, level))
 
     sp = _get_spotify_client()
-    current = sp.current_playback()
+    dev_id = _ensure_desktop_device(sp)
 
-    if not current:
-        msg = "No active Spotify device found. Please open Spotify on a device first, sir."
+    if not dev_id:
+        msg = "No Spotify device found. Please open the Spotify desktop app, sir."
         _log(msg, player)
         return msg
 
-    sp.volume(level)
+    sp.volume(level, device_id=dev_id)
     msg = f"Spotify volume set to {level}%, sir."
     _log(msg, player)
     return msg
