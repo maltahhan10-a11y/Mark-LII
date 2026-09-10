@@ -20,126 +20,6 @@ from datetime import datetime
 _CONTACTS_PATH = Path(__file__).resolve().parent.parent / "config" / "contacts.json"
 
 
-# ── Messages database access ────────────────────────────────────────────────
-#
-# Everything that reads message history goes through chat.db, and macOS puts
-# that file behind Full Disk Access. The file is mode 644 and plainly readable
-# by the user, but the kernel refuses the open anyway, and sqlite reports it as
-# the very unhelpful "unable to open database file". No amount of code gets
-# around this: it is a consent decision, and only the user can make it.
-
-DB_PATH = Path.home() / "Library" / "Messages" / "chat.db"
-
-FULL_DISK_SETTINGS_URL = (
-    "x-apple.systempreferences:com.apple.preference.security"
-    "?Privacy_AllFilesAccess"
-)
-
-
-def _host_app_name() -> str:
-    """Name the application the user actually has to tick in System Settings.
-
-    Full Disk Access is granted to the app that owns the process, which is the
-    terminal or editor Jarvis was launched from — not "Python". Naming the
-    wrong thing sends people to tick a box that changes nothing.
-    """
-    try:
-        import psutil
-
-        proc = psutil.Process()
-        for candidate in [proc] + proc.parents():
-            exe = candidate.exe() or ""
-            # The interpreter itself lives inside Python.framework's own
-            # Python.app. That bundle is not something the user can grant
-            # anything to, so keep walking up to the app that launched us.
-            if ".framework/" in exe or ".app/Contents/MacOS/" not in exe:
-                continue
-            # The first .app in the path is the outermost bundle: a helper
-            # process reports ".../Visual Studio Code.app/Contents/Frameworks/
-            # Code Helper.app/...", and the name worth printing is the outer one.
-            for part in exe.split("/"):
-                if part.endswith(".app"):
-                    name = part[:-4]
-                    if name.lower() != "python":
-                        return name
-                    break
-    except Exception:
-        pass
-    return "your terminal application"
-
-
-def _full_disk_access_help() -> str:
-    return (
-        f"I can't read the Messages database — macOS is blocking it. "
-        f"To fix it: open System Settings > Privacy & Security > Full Disk "
-        f"Access, turn it on for {_host_app_name()}, then restart me. "
-        f"That permission is what lets me read message history; sending "
-        f"messages works without it."
-    )
-
-
-def _chat_db_available() -> tuple[bool, str]:
-    """Can this process actually read chat.db right now?
-
-    Tested with a plain file open rather than by trying sqlite: a TCC denial
-    surfaces there as a clean PermissionError, where sqlite flattens every
-    cause into one ambiguous message.
-    """
-    if not DB_PATH.exists():
-        return False, (
-            "The Messages database doesn't exist on this Mac — Messages may "
-            "never have been set up."
-        )
-    try:
-        with open(DB_PATH, "rb") as fh:
-            fh.read(16)
-    except PermissionError:
-        return False, _full_disk_access_help()
-    except OSError as exc:
-        return False, f"Could not read the Messages database: {exc}"
-    return True, ""
-
-
-def _open_chat_db():
-    """Return (connection, error). Read-only, so a live Messages app is never
-    disturbed and the watch cannot lock the database against it."""
-    ok, reason = _chat_db_available()
-    if not ok:
-        return None, reason
-    try:
-        import sqlite3
-
-        conn = sqlite3.connect(
-            f"file:{DB_PATH}?mode=ro", uri=True, timeout=5.0
-        )
-        conn.row_factory = sqlite3.Row
-        return conn, ""
-    except Exception as exc:
-        return None, f"Could not open the Messages database: {exc}"
-
-
-def _handle_patterns(resolved: str) -> list[str]:
-    """LIKE patterns that match how Messages might have stored this handle.
-
-    A number saved as 5551234567 is stored by Messages as +15551234567, so
-    matching the saved form alone finds nothing. Matching on the last ten
-    digits catches every formatting of the same number without matching
-    unrelated ones.
-    """
-    ident = (resolved or "").strip()
-    if not ident:
-        return []
-    patterns = {f"%{ident}%"}
-    if "@" in ident:
-        return list(patterns)
-    digits = "".join(c for c in ident if c.isdigit())
-    if digits:
-        patterns.add(f"%{digits}%")
-        if len(digits) >= 10:
-            patterns.add(f"%{digits[-10:]}%")
-    return list(patterns)
-
-
 def _check_macos() -> str | None:
     if platform.system() != "Darwin":
         return "iMessage is only available on macOS."
@@ -215,26 +95,6 @@ def _is_phone_or_email(s: str) -> bool:
     return False
 
 
-def _normalise_identifier(identifier: str) -> str:
-    """Clean up an iMessage handle before it is stored or sent to.
-
-    An email address is a perfectly good iMessage handle, but the model tends
-    to copy the "+1234567890" shape from the tool description and hand back
-    "+someone@example.com". Messages will not match that against any buddy, and
-    the failure is silent, so strip the phone punctuation off anything that is
-    plainly an address.
-    """
-    ident = (identifier or "").strip()
-    if not ident:
-        return ident
-    if "@" in ident:
-        return ident.lstrip("+ ").strip().lower()
-    # A phone number: keep a leading +, drop the formatting humans add.
-    plus = ident.lstrip().startswith("+")
-    digits = "".join(c for c in ident if c.isdigit())
-    return ("+" + digits) if plus and digits else (digits or ident)
-
-
 def _resolve_contact(name_or_id: str) -> str:
     """
     Resolve a contact name to a phone number or email address.
@@ -249,14 +109,12 @@ def _resolve_contact(name_or_id: str) -> str:
     raw = name_or_id.strip()
 
     if _is_phone_or_email(raw):
-        return _normalise_identifier(raw)
+        return raw
 
     contacts = _load_contacts()
     mapped = contacts.get(raw.lower())
     if mapped:
-        # Stored entries are normalised on the way back out too, so contacts
-        # saved before this existed still resolve correctly.
-        return _normalise_identifier(mapped)
+        return mapped
 
     macos_result = _lookup_macos_contacts(raw)
     if macos_result:
@@ -284,12 +142,9 @@ def _add_contact(name: str, identifier: str) -> str:
         contacts = {}
         if _CONTACTS_PATH.exists():
             contacts = json.loads(_CONTACTS_PATH.read_text())
-        cleaned = _normalise_identifier(identifier)
-        if not cleaned:
-            return "That does not look like a phone number or email address."
-        contacts[name.strip()] = cleaned
+        contacts[name.strip()] = identifier.strip()
         _save_contacts(contacts)
-        return f"Contact saved: {name.strip()} → {cleaned}"
+        return f"Contact saved: {name.strip()} → {identifier.strip()}"
     except Exception as e:
         return f"Failed to save contact: {e}"
 
@@ -386,18 +241,19 @@ def _get_recent_messages(contact: str | None = None, count: int = 10) -> str:
     if err:
         return err
 
-    conn, db_err = _open_chat_db()
-    if conn is None:
-        return db_err
+    db_path = Path.home() / "Library" / "Messages" / "chat.db"
+    if not db_path.exists():
+        return "Messages database not found. Make sure Messages.app has been used on this Mac."
 
     try:
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+
         if contact:
             resolved = _resolve_contact(contact)
-            patterns = _handle_patterns(resolved)
-            if not patterns:
-                return f"I don't have a phone number or email for {contact}."
-            where = " OR ".join("h.id LIKE ?" for _ in patterns)
-            query = f"""
+            safe_contact = resolved.replace("'", "''")
+            query = """
                 SELECT
                     m.text,
                     m.is_from_me,
@@ -405,11 +261,14 @@ def _get_recent_messages(contact: str | None = None, count: int = 10) -> str:
                     h.id as handle_id
                 FROM message m
                 LEFT JOIN handle h ON m.handle_id = h.ROWID
-                WHERE ({where})
+                WHERE h.id LIKE ? OR h.id LIKE ?
                 ORDER BY m.date DESC
                 LIMIT ?
             """
-            rows = conn.execute(query, (*patterns, count)).fetchall()
+            rows = conn.execute(
+                query,
+                (f"%{safe_contact}%", f"%{safe_contact}%", count)
+            ).fetchall()
         else:
             query = """
                 SELECT
@@ -463,17 +322,18 @@ def _get_latest_from(contact: str) -> str:
     if not contact:
         return "Please specify a contact name, phone number, or email."
 
-    conn, db_err = _open_chat_db()
-    if conn is None:
-        return db_err
+    db_path = Path.home() / "Library" / "Messages" / "chat.db"
+    if not db_path.exists():
+        return "Messages database not found."
 
     try:
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+
         resolved = _resolve_contact(contact)
-        patterns = _handle_patterns(resolved)
-        if not patterns:
-            return f"I don't have a phone number or email for {contact}."
-        where = " OR ".join("h.id LIKE ?" for _ in patterns)
-        query = f"""
+        safe_contact = resolved.replace("'", "''")
+        query = """
             SELECT
                 m.text,
                 m.is_from_me,
@@ -482,13 +342,15 @@ def _get_latest_from(contact: str) -> str:
                 h.id as handle_id
             FROM message m
             LEFT JOIN handle h ON m.handle_id = h.ROWID
-            WHERE ({where})
+            WHERE (h.id LIKE ? OR h.id LIKE ?)
                 AND m.is_from_me = 0
                 AND m.text IS NOT NULL AND m.text != ''
             ORDER BY m.date DESC
             LIMIT 1
         """
-        row = conn.execute(query, tuple(patterns)).fetchone()
+        row = conn.execute(
+            query, (f"%{safe_contact}%", f"%{safe_contact}%")
+        ).fetchone()
         conn.close()
 
         if not row:
@@ -506,195 +368,107 @@ def _get_latest_from(contact: str) -> str:
 
 _active_watches: dict[str, dict] = {}
 _watch_lock = threading.Lock()
-_notifier = None          # set by main.py so a watch can actually speak
-POLL_SECONDS = 10
-
-
-def set_notifier(fn) -> None:
-    """Register how a watch announces a new message.
-
-    Without this a watch can only write to the activity log, which is not a
-    notification — the whole point of "tell me when Mimi texts" is to be told
-    while looking at something else. main.py passes the assistant's own speak().
-    """
-    global _notifier
-    _notifier = fn
-
-
-def _notify(text: str, player=None) -> None:
-    print(f"[iMessage] {text}")
-    if player is not None:
-        try:
-            player.write_log(f"JARVIS: {text}")
-        except Exception:
-            pass
-    if _notifier is not None:
-        try:
-            _notifier(text)
-        except Exception as exc:
-            print(f"[iMessage] Could not announce: {exc}")
-
-
-def _latest_from_db(conn, patterns: list[str], after: int = 0):
-    """Rows from `patterns` newer than `after`, oldest first."""
-    if not patterns:
-        return []
-    where = " OR ".join("h.id LIKE ?" for _ in patterns)
-    return conn.execute(
-        f"""
-        SELECT
-            m.text,
-            m.date AS raw_date,
-            datetime(m.date/1000000000 + 978307200, 'unixepoch', 'localtime') AS msg_date,
-            h.id AS handle_id
-        FROM message m
-        LEFT JOIN handle h ON m.handle_id = h.ROWID
-        WHERE ({where})
-            AND m.is_from_me = 0
-            AND m.date > ?
-            AND m.text IS NOT NULL AND m.text != ''
-        ORDER BY m.date ASC
-        """,
-        (*patterns, after),
-    ).fetchall()
 
 
 def _start_watch(contact: str, player=None) -> str:
-    """Watch for incoming messages from one contact.
-
-    If Full Disk Access has not been granted the watch is still created, in a
-    waiting state: the poll loop keeps checking, and the moment the permission
-    appears it takes a baseline and starts reporting. That way granting access
-    is all the user has to do — they do not also have to remember to come back
-    and re-issue the command.
-    """
     err = _check_macos()
     if err:
         return err
 
     if not contact:
-        return "Who should I watch for?"
+        return "Please specify a contact to watch for."
+
+    db_path = Path.home() / "Library" / "Messages" / "chat.db"
+    if not db_path.exists():
+        return "Messages database not found."
 
     resolved = _resolve_contact(contact)
     contact_lower = contact.lower()
-    patterns = _handle_patterns(resolved)
-
-    if not patterns or not _is_phone_or_email(resolved):
-        # An unresolved name would arm a watch against a handle that cannot
-        # exist, and it would sit there looking healthy forever.
-        return (
-            f"I don't have a phone number or email for {contact}, so there's "
-            f"nothing to watch. Add one first — say something like: "
-            f"add {contact} to my contacts as their number or email."
-        )
 
     with _watch_lock:
         if contact_lower in _active_watches:
             return f"Already watching for messages from {contact}."
 
-    conn, db_err = _open_chat_db()
-    baseline, pending = 0, False
-    if conn is not None:
-        try:
-            row = conn.execute(
-                "SELECT MAX(m.date) FROM message m "
-                "LEFT JOIN handle h ON m.handle_id = h.ROWID "
-                f"WHERE ({' OR '.join('h.id LIKE ?' for _ in patterns)}) "
-                "AND m.is_from_me = 0",
-                tuple(patterns),
-            ).fetchone()
-            baseline = (row[0] if row and row[0] else 0)
-        except Exception as exc:
-            conn.close()
-            return f"Could not set up the watch: {exc}"
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        safe_contact = resolved.replace("'", "''")
+        row = conn.execute(
+            """
+            SELECT MAX(m.date) as latest
+            FROM message m
+            LEFT JOIN handle h ON m.handle_id = h.ROWID
+            WHERE (h.id LIKE ? OR h.id LIKE ?)
+                AND m.is_from_me = 0
+            """,
+            (f"%{safe_contact}%", f"%{safe_contact}%")
+        ).fetchone()
         conn.close()
-    else:
-        pending = True
+        baseline = row[0] if row and row[0] else 0
+    except Exception as e:
+        return f"Could not set up watch: {e}"
 
     with _watch_lock:
         _active_watches[contact_lower] = {
             "contact": contact,
             "resolved": resolved,
-            "patterns": patterns,
             "baseline": baseline,
             "started": datetime.now().isoformat(),
             "active": True,
-            "pending": pending,
         }
 
     def _poll():
+        import sqlite3 as _sql
         while True:
-            time.sleep(POLL_SECONDS)
+            time.sleep(10)
             with _watch_lock:
                 info = _active_watches.get(contact_lower)
                 if not info or not info["active"]:
                     return
-                waiting = info["pending"]
-
-            conn, why = _open_chat_db()
-            if conn is None:
-                continue          # still no access — keep waiting quietly
 
             try:
-                if waiting:
-                    # Access has just appeared. Baseline on the newest existing
-                    # message so the backlog is not announced as if it were new.
-                    row = conn.execute(
-                        "SELECT MAX(m.date) FROM message m "
-                        "LEFT JOIN handle h ON m.handle_id = h.ROWID "
-                        f"WHERE ({' OR '.join('h.id LIKE ?' for _ in patterns)}) "
-                        "AND m.is_from_me = 0",
-                        tuple(patterns),
-                    ).fetchone()
-                    with _watch_lock:
-                        if contact_lower not in _active_watches:
-                            conn.close()
-                            return
-                        _active_watches[contact_lower]["baseline"] = (
-                            row[0] if row and row[0] else 0
-                        )
-                        _active_watches[contact_lower]["pending"] = False
-                    conn.close()
-                    _notify(
-                        f"I can read Messages now — watching for texts from {contact}.",
-                        player,
-                    )
-                    continue
-
-                rows = _latest_from_db(conn, patterns, info["baseline"])
+                conn = _sql.connect(str(db_path))
+                conn.row_factory = _sql.Row
+                sc = resolved.replace("'", "''")
+                rows = conn.execute(
+                    """
+                    SELECT
+                        m.text,
+                        m.date as raw_date,
+                        datetime(m.date/1000000000 + 978307200, 'unixepoch', 'localtime') as msg_date,
+                        h.id as handle_id
+                    FROM message m
+                    LEFT JOIN handle h ON m.handle_id = h.ROWID
+                    WHERE (h.id LIKE ? OR h.id LIKE ?)
+                        AND m.is_from_me = 0
+                        AND m.date > ?
+                        AND m.text IS NOT NULL AND m.text != ''
+                    ORDER BY m.date ASC
+                    """,
+                    (f"%{sc}%", f"%{sc}%", info["baseline"])
+                ).fetchall()
                 conn.close()
 
                 if rows:
                     with _watch_lock:
-                        if contact_lower in _active_watches:
-                            _active_watches[contact_lower]["baseline"] = rows[-1]["raw_date"]
-                    for row in rows:
-                        _notify(
-                            f"New message from {contact}: {row['text']}", player
-                        )
-            except Exception as exc:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                print(f"[iMessage] Watch error: {exc}")
+                        _active_watches[contact_lower]["baseline"] = rows[-1]["raw_date"]
 
-    thread = threading.Thread(
-        target=_poll, daemon=True, name=f"imessage-watch-{contact_lower}"
-    )
+                    for row in rows:
+                        msg = f"New message from {contact}: {row['text']}"
+                        print(f"[iMessage] {msg}")
+                        if player:
+                            try:
+                                player.write_log(f"JARVIS: {msg}")
+                            except Exception:
+                                pass
+            except Exception as e:
+                print(f"[iMessage] Watch error: {e}")
+
+    thread = threading.Thread(target=_poll, daemon=True, name=f"imessage-watch-{contact_lower}")
     thread.start()
 
     note = f" (resolved → {resolved})" if resolved != contact else ""
-    if pending:
-        return (
-            f"Watch armed for {contact}{note}, but I can't read Messages yet. "
-            f"{db_err} I'll start reporting the moment that's granted — "
-            "you won't need to ask again."
-        )
-    return (
-        f"Now watching for new messages from {contact}{note}. "
-        "I'll tell you when they text."
-    )
+    return f"Now watching for new messages from {contact}{note}. I'll notify you when they respond."
 
 
 def _stop_watch(contact: str) -> str:
@@ -712,37 +486,13 @@ def _stop_watch(contact: str) -> str:
     return f"Stopped watching for messages from {contact}."
 
 
-def _check_access(open_settings: bool = False) -> str:
-    """Report whether message history is readable, and offer the fix."""
-    err = _check_macos()
-    if err:
-        return err
-
-    ok, reason = _chat_db_available()
-    if ok:
-        return (
-            "I can read the Messages database — reading history and watching "
-            "for texts both work."
-        )
-    if open_settings:
-        try:
-            subprocess.run(
-                ["open", FULL_DISK_SETTINGS_URL], capture_output=True, timeout=10
-            )
-            return reason + " I've opened that settings pane for you."
-        except Exception:
-            pass
-    return reason
-
-
 def _list_watches() -> str:
     with _watch_lock:
         if not _active_watches:
             return "No active message watches."
         lines = ["Active message watches:"]
-        for _key, info in _active_watches.items():
-            state = " — waiting for Full Disk Access" if info.get("pending") else ""
-            lines.append(f"  - {info['contact']} (since {info['started']}){state}")
+        for key, info in _active_watches.items():
+            lines.append(f"  - {info['contact']} (since {info['started']})")
         return "\n".join(lines)
 
 
@@ -753,11 +503,15 @@ def _list_conversations(count: int = 15) -> str:
     if err:
         return err
 
-    conn, db_err = _open_chat_db()
-    if conn is None:
-        return db_err
+    db_path = Path.home() / "Library" / "Messages" / "chat.db"
+    if not db_path.exists():
+        return "Messages database not found."
 
     try:
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+
         rows = conn.execute(
             """
             SELECT
@@ -796,13 +550,6 @@ def _list_conversations(count: int = 15) -> str:
 
 def imessage(parameters: dict, player=None) -> str:
     action = (parameters.get("action") or "").strip().lower()
-    action = action.replace("-", "_").replace(" ", "_")
-    action = {
-        "notify": "watch", "notify_me": "watch", "watch_for": "watch",
-        "unwatch": "stop_watch", "stop": "stop_watch",
-        "permissions": "check_access", "check_permissions": "check_access",
-        "diagnose": "check_access",
-    }.get(action, action)
 
     _ACTIONS = {
         "send":            lambda: _send_imessage(
@@ -824,9 +571,6 @@ def imessage(parameters: dict, player=None) -> str:
             parameters.get("contact", "")
         ),
         "list_watches":    lambda: _list_watches(),
-        "check_access":    lambda: _check_access(
-            bool(parameters.get("open_settings", False))
-        ),
         "add_contact":     lambda: _add_contact(
             parameters.get("name", ""), parameters.get("identifier", "")
         ),
@@ -841,7 +585,7 @@ def imessage(parameters: dict, player=None) -> str:
         return (
             f"Unknown iMessage action: '{action}'. "
             "Available: send | read | latest | conversations | watch | stop_watch | "
-            "list_watches | check_access | add_contact | remove_contact | list_contacts"
+            "list_watches | add_contact | remove_contact | list_contacts"
         )
 
     try:
