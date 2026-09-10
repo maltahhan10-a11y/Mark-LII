@@ -7,12 +7,13 @@ import subprocess
 import platform
 from pathlib import Path
 
-# pyautogui costs ~94 MB on macOS (it pulls pyobjc/Quartz behind it), and
-# most sessions never touch the mouse. The proxy imports it on first use;
-# the flag answers "is it installed?" without importing anything.
-from core.lazy_import import LazyModule, available, _configure_pyautogui
-pyautogui = LazyModule("pyautogui", _configure_pyautogui)
-_PYAUTOGUI = available("pyautogui")
+try:
+    import pyautogui
+    pyautogui.FAILSAFE = True
+    pyautogui.PAUSE    = 0.05
+    _PYAUTOGUI = True
+except ImportError:
+    _PYAUTOGUI = False
 
 try:
     import pyperclip

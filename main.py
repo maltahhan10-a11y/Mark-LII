@@ -88,7 +88,6 @@ import numpy as np
 from google import genai
 from google.genai import types
 from ui import JarvisUI
-from core import models
 from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
     save_session_summary, pop_last_session,
@@ -121,9 +120,6 @@ from actions.spotify_control   import spotify_control
 from actions.home_assistant    import home_assistant
 from actions.todoist_control   import todoist_control
 from actions.apple_notes       import apple_notes
-from actions.apple_maps        import apple_maps
-from actions.blender_control   import blender_control
-from actions.face_id           import face_id
 from actions.apple_native      import apple_native
 from actions.public_data       import public_data
 from actions.google_calendar   import google_calendar
@@ -146,7 +142,7 @@ def get_base_dir():
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
-LIVE_MODEL          = models.for_task("live")
+LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
@@ -175,15 +171,10 @@ def _pcm_level(samples) -> float:
 
 
 def _load_all_api_keys() -> list[str]:
-    """Return [primary, fallback1, fallback2, ...] Gemini API keys.
-
-    Reads through the shared mtime-keyed config cache. _get_api_key() sits in
-    front of every Gemini request, so this used to open and JSON-parse the
-    config file on each one; now it costs a stat() unless the user has
-    actually edited their settings.
-    """
-    cfg = models.config()
-    keys = [cfg.get("gemini_api_key", "")]
+    """Return [primary, fallback1, fallback2, ...] Gemini API keys."""
+    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    keys = [cfg["gemini_api_key"]]
     keys.extend(cfg.get("gemini_api_key_fallbacks", []))
     return [k for k in keys if k]
 
@@ -440,41 +431,11 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "file_controller",
-        "description": (
-            "Do things with the user's files and folders by voice, the way "
-            "they would otherwise drag, drop, rename and delete by hand. "
-            "This is the tool for ANY spoken request about files.\n"
-            "Mapping what people actually say:\n"
-            "- 'what's on my desktop', 'what's in downloads', 'show me my "
-            "files' -> action='list'\n"
-            "- 'clean up my downloads', 'organise my desktop', 'sort this "
-            "folder', 'my downloads are a mess' -> action='organize' with "
-            "path='downloads'. Add by='date' when they talk about WHEN things "
-            "arrived ('group by month', 'sort by date'); otherwise by='type' "
-            "groups images, documents, videos, archives and code.\n"
-            "- 'rename X to Y' -> action='rename' with name and new_name\n"
-            "- 'move X to Y', 'put that in documents' -> action='move'\n"
-            "- 'delete X', 'get rid of X', 'bin that' -> action='delete'. This "
-            "moves to the Trash, so it is recoverable, and it is undoable.\n"
-            "- 'find my tax pdf', 'where is that file' -> action='find' with "
-            "name and/or extension\n"
-            "- 'what's taking up space', 'biggest files' -> action='largest'\n"
-            "- 'how much space is left' -> action='disk_usage'\n"
-            "- 'make a folder called X' -> action='create_folder'\n"
-            "- 'what is this file' -> action='info'\n"
-            "For path, prefer the plain shortcuts: desktop, downloads, "
-            "documents, pictures, music, videos, home. Only use a full path "
-            "when the user gives one.\n"
-            "Everything here is confined to the user's home folder and every "
-            "change can be reversed with the undo tool, so act on a clear "
-            "instruction rather than asking again. The one thing worth "
-            "confirming first is a delete the user has not clearly asked for "
-            "by name."
-        ),
+        "description": "Manages files and folders: list, create, delete, move, copy, rename, read, write, find, disk usage.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "list | organize | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | info"},
+                "action":      {"type": "STRING", "description": "list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info"},
                 "path":        {"type": "STRING", "description": "File/folder path or shortcut: desktop, downloads, documents, home"},
                 "destination": {"type": "STRING", "description": "Destination path for move/copy"},
                 "new_name":    {"type": "STRING", "description": "New name for rename"},
@@ -482,7 +443,6 @@ TOOL_DECLARATIONS = [
                 "name":        {"type": "STRING", "description": "File name to search for"},
                 "extension":   {"type": "STRING", "description": "File extension to search (e.g. .pdf)"},
                 "count":       {"type": "INTEGER", "description": "Number of results for largest"},
-                "by":          {"type": "STRING", "description": "For organize: 'type' (default — images, documents, videos, archives, code) or 'date' (grouped by the month the file arrived; usually what Downloads wants)."},
             },
             "required": ["action"]
         }
@@ -600,87 +560,6 @@ TOOL_DECLARATIONS = [
         }
     },
     {
-        "name": "run_plan",
-        "description": (
-            "Work through a multi-step goal on your own, using your own tools, "
-            "one step at a time. Use this when a request needs several tools in "
-            "sequence and each step depends on what the last one found — "
-            "'find the biggest files in Downloads and bin the old installers', "
-            "'check my calendar then message whoever I am meeting', 'look at "
-            "my desktop, organise it, then tell me what changed'.\n"
-            "Do NOT use it for anything a single tool already does. One "
-            "lookup, one setting, one message, one file — call that tool "
-            "directly instead; wrapping it in a plan is slower and no better.\n"
-            "This runs locally on your own tools and is free, unlike hermes, "
-            "which is an outside research agent. Prefer this for anything "
-            "about THIS computer, and hermes for anything that needs the web."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "goal":  {"type": "STRING", "description": "The whole goal in one sentence, with any detail needed to judge when it is finished."},
-                "steps": {"type": "STRING", "description": "Optional step ceiling, 1-8. Default 8. Lower it for simple goals."},
-            },
-            "required": ["goal"],
-        },
-    },
-    {
-        "name": "hermes",
-        "description": (
-            "Hand a slow, open-ended job to Hermes, a research agent that works "
-            "in many steps. Use it when answering properly needs searching, "
-            "reading and cross-checking rather than one lookup: 'find out what "
-            "changed with X', 'research Y and tell me what matters', 'compare "
-            "these options', 'dig into why Z happened'. "
-            "Do NOT use it for anything another tool already does — a single "
-            "web search, the weather, a calculation, controlling an app, or "
-            "anything about files on this machine. Those are faster and free; "
-            "Hermes costs several API calls and takes up to a few minutes. "
-            "It is rate limited on purpose, so if it says the budget is spent, "
-            "tell the user plainly rather than retrying. "
-            "Action 'usage' reports how much of the budget is left."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "query":  {"type": "STRING", "description": "The job, written as a complete instruction. Hermes cannot see this conversation, so include the context it needs."},
-                "action": {"type": "STRING", "description": "'ask' (default) to run a job, or 'usage' to report remaining budget."},
-                "steps":  {"type": "STRING", "description": "Optional cap on reasoning steps, e.g. '6'. Lower is cheaper. Capped by the configured limit regardless."},
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "make_call",
-        "description": (
-            "Place a real phone call and talk to the person on the user's "
-            "behalf. Use it when the user says 'call Mom', 'call Ahmed', "
-            "'phone the dentist' or similar. "
-            "The call goes out over the user's own iPhone on their own SIM, so "
-            "the recipient sees the user's real number and answers a normal "
-            "phone call. "
-            "IMPORTANT — the confirmation flow: call this first WITHOUT "
-            "'confirmed'. It will come back with a question naming the person "
-            "and number. Read that question to the user. Only when they say "
-            "yes, call it again with the same 'who' plus confirmed='true'. "
-            "Never set confirmed='true' on the first attempt — a misheard name "
-            "would ring the wrong person. "
-            "Always pass 'purpose': what the user actually wants said. Without "
-            "it Jarvis reaches the other person with nothing to say. "
-            "action='hangup' ends a call in progress."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "who":       {"type": "STRING", "description": "Contact name ('Mama') or a full number in international form."},
-                "purpose":   {"type": "STRING", "description": "What to say or ask, in the user's own words. Include everything the other person needs to hear."},
-                "confirmed": {"type": "STRING", "description": "'true' ONLY after the user has said yes to the confirmation question. Omit otherwise."},
-                "action":    {"type": "STRING", "description": "'call' (default) or 'hangup'."},
-            },
-            "required": ["who"],
-        },
-    },
-    {
         "name": "manage_monitor",
         "description": (
             "Add, remove, or list background monitoring topics. "
@@ -764,171 +643,18 @@ TOOL_DECLARATIONS = [
         }
     },
     {
-        "name": "face_id",
-        "description": (
-            "Looks at whoever is in front of the webcam. "
-            "action='guess_age' is the party trick — use it whenever the user "
-            "asks you to guess their age, how old they look, or how old "
-            "someone is. "
-            "action='scan' looks at everyone in view — use it for 'scan the "
-            "faces', 'scan for nearby faces', 'who's here', 'look around'. "
-            "For anyone recognised it returns what is SAVED about them rather "
-            "than a guess, already ordered by importance: name, then age, "
-            "then what they do (job, employer, school or university). Relay "
-            "that summary to the user in full and in that order, every time — "
-            "it is the point of the scan. It only estimates age and gender "
-            "for faces it does not know. "
-            "The scan also returns follow-up questions offering the details "
-            "that were deliberately left out (courses, hobbies, favourite "
-            "colour, what they are watching, birthday). Ask those questions "
-            "as they come back; do not answer them unprompted. When the user "
-            "says yes, call action='details' with 'name' and 'attribute' to "
-            "fetch it — 'attribute' is the thing they want, e.g. 'courses', "
-            "'favourite colour', 'birthday'. action='details' with only a "
-            "'name' lists everything saved about that person. "
-            "action='enroll' with a 'name' teaches you someone's face "
-            "('remember this face as Alex', 'this is my sister Sam'), and "
-            "action='identify' names who is on camera. 'forget' with a name "
-            "removes someone, 'list' says whose faces are known. "
-            "An age you ESTIMATED is a rough guess — say so lightly. An age "
-            "that came back as part of a saved profile is a fact: state it "
-            "plainly and never hedge it. The user can say this in ANY "
-            "language."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "action":    {"type": "STRING", "description": "guess_age | scan | enroll | identify | forget | list | details"},
-                "name":      {"type": "STRING", "description": "Person's name — for enroll, forget, or details"},
-                "attribute": {"type": "STRING", "description": "For action='details': which saved detail the user asked for, e.g. 'courses', 'hobbies', 'favourite colour', 'birthday'. Omit to list everything saved about them."},
-            },
-            "required": ["action"]
-        }
-    },
-    {
-        "name": "blender_control",
-        "description": (
-            "Builds 3D models in Blender. This opens Blender, starts a new "
-            "file, and models whatever the user describes — parts, assembly, "
-            "materials and colours, all of it. "
-            "action='create' with a 'description' is the main one: use it for "
-            "'make me a 3D rocket', 'model a castle', 'build a car in "
-            "Blender', 'create a 3D X'. It handles real architecture and "
-            "engineering structures too — bridges, towers, stadiums, "
-            "buildings — including named real-world ones such as the Gordie "
-            "Howe International Bridge; for those, put what you know about "
-            "the real structure (its type, spans, towers, proportions) into "
-            "'description' rather than just its name, because the builder "
-            "models what the description says. Put the user's full "
-            "description in 'description', including any detail they gave "
-            "about style, colour or size — more detail there produces a "
-            "better model. "
-            "action='modify' with a 'description' changes what is already on "
-            "screen ('make the fins bigger', 'paint it blue') without "
-            "starting over. "
-            "There are THREE ways it can build and 'method' picks between "
-            "them. method='library' (FREE, instant, best quality) searches "
-            "Sketchfab for a model a human already made and imports it — use "
-            "it for any real, nameable object: creatures, animals, dragons, "
-            "vehicles, weapons, furniture, plants, tools, instruments, "
-            "props. Prefer it whenever the thing plausibly exists, because it "
-            "costs nothing and returns proper topology and materials. If the "
-            "user rejects the model, call again with 'index' 1, 2 or 3 to take "
-            "the next match. "
-            "method='script' composes the model out of primitives: use "
-            "it for anything with named parts in a fixed arrangement — "
-            "bridges, buildings, towers, rooms, streets, machines, scenes "
-            "with several objects. The result stays editable and rebuilding "
-            "it is free. method='trellis' generates the model with Microsoft "
-            "TRELLIS.2 from a reference picture: use it for anything whose "
-            "SHAPE is the point and no arrangement of boxes describes it — "
-            "creatures, characters, statues, vehicles, plants, single "
-            "objects, and anything abstract, surreal or invented ('a melting "
-            "clock made of frosted glass', 'a cross between a shark and a "
-            "helicopter'). It costs a paid API call per new model and takes "
-            "one to three minutes. method='auto' (the default) guesses from "
-            "the description; set it explicitly when you know better, because "
-            "you usually do — but only reach for 'trellis' when the thing "
-            "genuinely does not exist and the library cannot have it. "
-            "For method='trellis' the reference picture is found or drawn "
-            "automatically: real, nameable things are photographed via web "
-            "search, invented ones are generated. 'prefer' overrides that "
-            "with 'search' or 'generate'. 'quality' is fast | standard | "
-            "best, trading time and cost for resolution and detail. "
-            "Every successful build is saved to a .blend file automatically, "
-            "so you never need to call 'save' just to preserve a result — the "
-            "reply tells you where it went. Rebuilding the same description "
-            "replays the saved script instead of modelling it again, which is "
-            "both faster and free; say 'rebuild' or set reuse=false only when "
-            "the user actually wants a different attempt. "
-            "action='preview' renders a picture of the result, 'save' writes a "
-            ".blend file to a path you choose, 'status' says what is open, and "
-            "'open' just launches Blender. "
-            "A build takes one to two minutes, so tell the user you are "
-            "starting and that it will take a moment BEFORE you call this, "
-            "then report what came back. Never claim it is finished until the "
-            "tool has returned. The user can say this in ANY language."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "action":      {"type": "STRING", "description": "create | modify | preview | save | status | open"},
-                "description": {"type": "STRING", "description": "What to build, or what to change — the user's full description"},
-                "quality":     {"type": "STRING", "description": "For script: fast (default) or best. For trellis: fast | standard (default) | best. 'best' makes me look at a render of my own work and correct it — use it when the user asks for the best possible result, or says to take my time. It doubles the time."},
-                "path":        {"type": "STRING", "description": "Optional .blend path for save"},
-                "reuse":       {"type": "STRING", "description": "'false' to force a fresh build instead of replaying the saved result for this description. Default true."},
-                "method":      {"type": "STRING", "description": "auto (default) | library (Sketchfab — FREE, a real model someone already made; best for any nameable object) | script (primitives — structures, buildings, multi-object scenes; free) | trellis (TRELLIS.2 generation — only for invented/abstract things no library could hold; costs a paid call)"},
-                "index":       {"type": "STRING", "description": "For method='library': which search match to take. '0' is best (default); use '1'/'2'/'3' when the user rejects the first one."},
-                "commercial":  {"type": "STRING", "description": "For method='library': 'false' to also allow NonCommercial-licensed models. Default true (commercial-safe licences only)."},
-                "prefer":      {"type": "STRING", "description": "For method='trellis': how to get the reference picture. auto (default) | search (photograph a real thing) | generate (draw something invented)"},
-            },
-            "required": ["action"]
-        }
-    },
-    {
-        "name": "apple_maps",
-        "description": (
-            "Opens Apple Maps for directions, place search, or showing a "
-            "location (macOS only). Use action='directions' whenever the user "
-            "asks how to get somewhere, for a route, for navigation, or to be "
-            "taken to a place — set 'destination', and 'origin' only if they "
-            "named a starting point other than where they are. Use "
-            "action='search' to find places or businesses nearby (e.g. 'coffee "
-            "near me', 'gas stations'), and action='show' to just display one "
-            "place. Maps takes over once opened, so report that you opened it "
-            "rather than describing the route. The user can say this in ANY "
-            "language."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "action":      {"type": "STRING", "description": "directions | search | show | open"},
-                "destination": {"type": "STRING", "description": "Where to go, for directions/show"},
-                "origin":      {"type": "STRING", "description": "Starting point; omit to route from the user's current location"},
-                "mode":        {"type": "STRING", "description": "drive | walk | transit | cycle (default: drive)"},
-                "query":       {"type": "STRING", "description": "What to look for, for search"},
-            },
-            "required": ["action"]
-        }
-    },
-    {
         "name": "apple_notes",
         "description": (
-            "Read, search, create and write into notes in Apple Notes (macOS "
-            "only). Use action='append_note' to write something into a note — "
-            "adding a line to a list, jotting something down, or noting an "
-            "idea — which adds to the end of that note, creating it if it does "
-            "not exist yet. Use action='create_note' only for a brand new note "
-            "that should replace nothing. Also lists notes and folders, reads a "
-            "note, and searches across all notes. Use for ANY Apple Notes "
-            "request."
+            "Read, search, and create notes in Apple Notes (macOS only). "
+            "List recent notes, read note content, search across all notes, "
+            "create new notes, list folders. Use for ANY Apple Notes request."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action": {"type": "STRING", "description": "list_notes | read_note | search_notes | create_note | append_note | list_folders"},
-                "title":  {"type": "STRING", "description": "Note title for read_note, create_note or append_note"},
-                "body":   {"type": "STRING", "description": "Text to write, for create_note or append_note"},
+                "action": {"type": "STRING", "description": "list_notes | read_note | search_notes | create_note | list_folders"},
+                "title":  {"type": "STRING", "description": "Note title for read_note or create_note"},
+                "body":   {"type": "STRING", "description": "Note body/content for create_note"},
                 "folder": {"type": "STRING", "description": "Folder name for list_notes or create_note"},
                 "query":  {"type": "STRING", "description": "Search query for search_notes"},
                 "limit":  {"type": "INTEGER", "description": "Max notes to list (default: 10)"},
@@ -1039,35 +765,24 @@ TOOL_DECLARATIONS = [
     {
         "name": "imessage",
         "description": (
-            "Sends and reads iMessages, and watches for incoming ones (macOS "
-            "only). "
-            "action='send' texts someone. "
-            "action='watch' is for 'tell me when Mimi texts', 'notify me when "
-            "Baba messages', 'watch for texts from Mama', 'let me know if she "
-            "replies' — I then announce new messages from that person as they "
-            "arrive, until action='stop_watch'. "
-            "action='read' and 'latest' show message history, 'conversations' "
-            "lists recent threads. "
-            "Contacts can be saved by name with add_contact, where the "
-            "identifier is EITHER a phone number ('+15551234567') OR an email "
-            "address ('someone@example.com') — pass an email exactly as given, "
-            "with no '+' in front of it. "
-            "If reading or watching reports that macOS is blocking the "
-            "Messages database, relay that instruction to the user verbatim; "
-            "action='check_access' re-checks it. "
-            "The user can say this in ANY language."
+            "Send and read iMessages on macOS. "
+            "Send a text message to any contact BY NAME (resolves via saved contacts or macOS Contacts.app), "
+            "read recent messages, check the latest message from someone, list conversations, "
+            "and WATCH for replies from a specific person (notifies you when they respond). "
+            "Use add_contact to save a name→phone mapping so future messages resolve correctly. "
+            "Use for ANY iMessage, text message, or SMS request. "
+            "Prefer this over send_message for Apple/iMessage users."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":     {"type": "STRING", "description": "send | read | latest | conversations | watch | stop_watch | list_watches | check_access | add_contact | remove_contact | list_contacts"},
-                "to":         {"type": "STRING", "description": "Recipient name, phone, or email for send"},
+                "action":     {"type": "STRING", "description": "send | read | latest | conversations | watch | stop_watch | list_watches | add_contact | remove_contact | list_contacts"},
+                "to":         {"type": "STRING", "description": "Recipient name, phone, or email for send — names are resolved to phone numbers automatically"},
                 "message":    {"type": "STRING", "description": "Message text for send"},
                 "contact":    {"type": "STRING", "description": "Contact name, phone, or email for read/latest/watch/stop_watch"},
                 "count":      {"type": "INTEGER", "description": "Number of messages/conversations to return (default: 10)"},
-                "name":       {"type": "STRING", "description": "Display name for add_contact/remove_contact (e.g. 'Mimi')"},
-                "identifier": {"type": "STRING", "description": "Phone number OR email address for add_contact (e.g. '+15551234567' or 'someone@example.com')"},
-                "open_settings": {"type": "BOOLEAN", "description": "For check_access: open the Full Disk Access settings pane"},
+                "name":       {"type": "STRING", "description": "Display name for add_contact/remove_contact (e.g. 'Ali')"},
+                "identifier": {"type": "STRING", "description": "Phone number or email for add_contact (e.g. '+1234567890')"},
             },
             "required": ["action"]
         }
@@ -1115,10 +830,6 @@ TOOL_DECLARATIONS = [
             "action='show' brings it back ('Jarvis show'), "
             "action='expand' opens its side panel with live status and recent "
             "activity, and action='minimize' folds that panel away. "
-            "action='agents' expands the orb into the agent launcher — a card "
-            "per agent showing its name, what it does, and a RUN button. Use "
-            "it whenever the user asks to see, pull up, open or list agents. "
-            "action='hide_agents' closes that launcher. "
             "Hiding the orb is cosmetic only: you keep listening and every "
             "tool keeps working. Do NOT use this to close the dashboard "
             "window — that is hub_control. "
@@ -1129,33 +840,10 @@ TOOL_DECLARATIONS = [
             "properties": {
                 "action": {
                     "type": "STRING",
-                    "description": "show | hide | expand | minimize | toggle | agents | hide_agents",
+                    "description": "show | hide | expand | minimize | toggle",
                 },
             },
             "required": ["action"],
-        }
-    },
-    {
-        "name": "sleep_mode",
-        "description": (
-            "Puts the assistant to sleep, or wakes it back up. "
-            "Call with action='sleep' when the user says to sleep, go to "
-            "sleep, stand by, take a break, stop listening, be quiet for now, "
-            "or 'goodnight' — anything meaning 'stop paying attention but stay "
-            "running'. This mutes the microphone; the user wakes you again by "
-            "clapping, pinch-tapping, clicking the orb, or pressing F4, NOT by "
-            "speaking, so say so briefly as you go. "
-            "This is NOT shutdown_jarvis: sleeping keeps every integration, "
-            "reminder and message watch running. Only use shutdown_jarvis if "
-            "the user clearly wants to quit or close the app entirely. "
-            "The user can say this in ANY language."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "action": {"type": "STRING", "description": "sleep | wake | status"},
-            },
-            "required": ["action"]
         }
     },
     {
@@ -1383,13 +1071,6 @@ class JarvisLive:
         # Pinch-tap / double-click on the orb: unmuting is handled by the UI,
         # this just tells the live session someone is about to speak.
         self.ui.on_wake           = self._on_wake
-        # A message watch runs on its own thread; give it a way to actually
-        # announce, rather than only writing to the activity log.
-        try:
-            from actions.imessage import set_notifier as _set_msg_notifier
-            _set_msg_notifier(self.speak)
-        except Exception as _exc:
-            print(f"[JARVIS] Could not arm message notifications: {_exc}")
         self.ui.on_voice_change   = self._on_voice_change     # voice picker → rebuild session
         self.ui.on_audio_device_change = self._on_audio_device_change
         self._reconnect_event: asyncio.Event | None = None
@@ -1635,11 +1316,10 @@ class JarvisLive:
             "control: a clap wakes you when you are asleep or muted and opens "
             "the hub otherwise, an open palm swiped sideways hides the hub, a "
             "pinch-tap wakes you, a palm pushed at the camera stops you, a "
-            "pinch-drag moves the orb, two fingers up with the THUMB OUT "
-            "turned like a knob changes the volume (clockwise up), and the "
-            "same two fingers with the THUMB TUCKED IN slid up or down "
-            "changes screen brightness. Those two adjust the machine directly "
-            "without going through you, so do not narrate them. Say 'hide' to put the orb away and 'show' to bring it back, "
+            "pinch-drag moves the orb, one raised finger dragged up or down "
+            "changes the volume, and two raised fingers change screen "
+            "brightness. Those two adjust the machine directly without going "
+            "through you, so do not narrate them. Say 'hide' to put the orb away and 'show' to bring it back, "
             "and ask for a specific part of the hub — the logs, system "
             "monitor, memory, plugins, audio devices, settings — to open it "
             "straight onto that section.\n\n"
@@ -1837,49 +1517,6 @@ class JarvisLive:
                 r = await loop.run_in_executor(None, get_system_status)
                 result = str(r)
 
-            elif name == "run_plan":
-                from actions import harness
-                goal = (args.get("goal") or "").strip()
-                try:
-                    steps = int(str(args.get("steps") or harness.MAX_STEPS))
-                except ValueError:
-                    steps = harness.MAX_STEPS
-                result = await harness.run(
-                    goal, self, steps,
-                    lambda m: self.player.write_log(f"Jarvis: {m}") if self.player else None,
-                )
-
-            elif name == "hermes":
-                from actions import hermes_agent
-                action = (args.get("action") or "ask").lower().strip()
-                if action == "usage":
-                    result = await asyncio.to_thread(hermes_agent.usage_summary)
-                else:
-                    query = (args.get("query") or "").strip()
-                    try:
-                        steps = int(str(args.get("steps") or "0")) or None
-                    except ValueError:
-                        steps = None
-                    ok, text = await asyncio.to_thread(
-                        hermes_agent.ask, query, steps, hermes_agent.SAFE_TOOLSETS,
-                        lambda m: self.player.write_log(f"Jarvis: {m}") if self.player else None,
-                    )
-                    result = text
-
-            elif name == "make_call":
-                from actions import phone_call
-                act = (args.get("action") or "call").strip().lower()
-                if act == "hangup":
-                    result = await asyncio.to_thread(phone_call.hangup)
-                else:
-                    who = (args.get("who") or "").strip()
-                    purpose = (args.get("purpose") or "").strip()
-                    confirmed = str(args.get("confirmed") or "").lower() in ("true", "yes", "1")
-                    result = await asyncio.to_thread(
-                        phone_call.call, who, purpose, self.player,
-                        False if confirmed else None,
-                    )
-
             elif name == "manage_monitor":
                 action = args.get("action", "").lower().strip()
                 topic  = args.get("topic", "").strip()
@@ -1925,18 +1562,6 @@ class JarvisLive:
                 r = await loop.run_in_executor(None, lambda: gmail_control(parameters=args, player=self.ui))
                 result = r or "Done."
 
-            elif name == "face_id":
-                r = await loop.run_in_executor(None, lambda: face_id(parameters=args, player=self.ui))
-                result = r or "Done."
-
-            elif name == "blender_control":
-                r = await loop.run_in_executor(None, lambda: blender_control(parameters=args, player=self.ui))
-                result = r or "Done."
-
-            elif name == "apple_maps":
-                r = await loop.run_in_executor(None, lambda: apple_maps(parameters=args, player=self.ui))
-                result = r or "Done."
-
             elif name == "imessage":
                 r = await loop.run_in_executor(None, lambda: imessage(parameters=args, player=self.ui))
                 result = r or "Done."
@@ -1966,18 +1591,9 @@ class JarvisLive:
 
             elif name == "orb_control":
                 act = (args.get("action") or "toggle").strip().lower()
-                if act in ("agents", "agent", "show_agents", "list_agents"):
-                    from actions import agents as _agents
-                    self.ui.orb_action("agents")
-                    names = [a.name.title() for a in _agents.catalogue()]
-                    result = ("Agents are up: " + ", ".join(names) +
-                              ". Press RUN on any of them, or just tell me which.")
-                elif act in ("hide_agents", "close_agents"):
-                    self.ui.orb_action("hide_agents")
-                    result = "Closed the agent launcher."
-                elif act not in ("show", "hide", "expand", "minimize", "minimise",
-                                 "collapse", "toggle"):
-                    result = "Use show, hide, expand, agents or minimize."
+                if act not in ("show", "hide", "expand", "minimize", "minimise",
+                               "collapse", "toggle"):
+                    result = "Use show, hide, expand or minimize."
                 else:
                     self.ui.orb_action(act)
                     result = {
@@ -1985,26 +1601,6 @@ class JarvisLive:
                         "hide":   "Orb hidden — still listening.",
                         "expand": "Orb panel expanded.",
                     }.get(act, "Done.")
-
-            elif name == "sleep_mode":
-                act = (args.get("action") or "sleep").strip().lower()
-                if act in ("wake", "wake_up", "awake", "resume"):
-                    self.ui.wake()
-                    result = "Awake and listening."
-                elif act == "status":
-                    result = f"I am {'asleep' if self.ui.asleep else 'awake'}."
-                else:
-                    # Say goodnight *before* muting: the reply has to make it
-                    # out through the speaker, and the mute lands immediately.
-                    async def _sleep_after_reply():
-                        await asyncio.sleep(2.5)
-                        self.ui.sleep()
-                    asyncio.create_task(_sleep_after_reply())
-                    result = (
-                        "Going to sleep. Tell the user briefly that you are "
-                        "sleeping and that a clap, a pinch-tap, the orb or F4 "
-                        "will wake you."
-                    )
 
             elif name == "shutdown_jarvis":
                 self.ui.write_log("SYS: Shutdown requested.")
@@ -2483,7 +2079,7 @@ class JarvisLive:
             client = _genai.Client(api_key=_get_api_key())
             resp   = await asyncio.to_thread(
                 client.models.generate_content,
-                model=models.for_task("text"),
+                model="gemini-flash-latest",
                 contents=prompt,
             )
             summary = (resp.text or "").strip()
@@ -2865,6 +2461,3 @@ def main():
 
     threading.Thread(target=runner, daemon=True).start()
     ui.root.mainloop()
-
-if __name__ == "__main__":
-    main()
