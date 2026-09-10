@@ -17,6 +17,10 @@ BASE_DIR         = get_base_dir()
 API_CONFIG_PATH  = BASE_DIR / "config" / "api_keys.json"
 PROJECTS_DIR     = Path.home() / "Desktop" / "JarvisProjects"
 MAX_FIX_ATTEMPTS = 5
+# Bounds on untrusted planner output — see _validate_plan.
+MAX_AGENT_FILES  = 24
+MAX_AGENT_DEPENDENCIES = 32
+_SAFE_DEPENDENCY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-\[\],<>=!~]*$")
 # Planning is reasoning about structure; writing is code. Routed apart so
 # each gets the model suited to it. See core/models.py.
 MODEL_PLANNER    = models.for_task("text")
@@ -48,6 +52,72 @@ def _strip_fences(text: str) -> str:
 def _is_rate_limit(error: Exception) -> bool:
     msg = str(error).lower()
     return "429" in msg or "quota" in msg or "resource_exhausted" in msg
+
+
+def _safe_project_path(project_dir: Path, relative_path: str) -> Path:
+    """Resolve a model-provided project path without allowing workspace escape."""
+    raw = (relative_path or "").strip().replace("\\", "/")
+    path = Path(raw)
+    if not raw or path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
+        raise ValueError(f"Unsafe project file path: {relative_path!r}")
+    root = project_dir.resolve()
+    resolved = (root / path).resolve()
+    if root not in resolved.parents:
+        raise ValueError(f"Project file must stay inside its workspace: {relative_path!r}")
+    return resolved
+
+
+def _validate_plan(plan: dict) -> dict:
+    """Normalize untrusted planner output into a bounded, safe build plan.
+
+    The planner is useful for architecture, but its JSON must not dictate paths
+    outside the requested project directory or pass arbitrary pip flags. This
+    keeps autonomous builds useful without granting accidental host-level writes.
+    """
+    if not isinstance(plan, dict):
+        raise ValueError("Planner returned an invalid project plan.")
+
+    files_out: list[dict] = []
+    seen: set[str] = set()
+    for item in plan.get("files", [])[:MAX_AGENT_FILES]:
+        if not isinstance(item, dict):
+            continue
+        raw_path = str(item.get("path", "")).strip().replace("\\", "/")
+        path_obj = Path(raw_path)
+        if (not raw_path or path_obj.is_absolute() or ".." in path_obj.parts
+                or raw_path in seen):
+            continue
+        seen.add(raw_path)
+        imports = item.get("imports", [])
+        if not isinstance(imports, list):
+            imports = []
+        files_out.append({
+            "path": raw_path,
+            "description": str(item.get("description", ""))[:2000],
+            "imports": [str(value)[:180] for value in imports[:30]],
+        })
+    if not files_out:
+        raise ValueError("Planner returned no safe files to build.")
+
+    known_paths = {item["path"] for item in files_out}
+    entry = str(plan.get("entry_point", files_out[-1]["path"])).strip().replace("\\", "/")
+    if entry not in known_paths:
+        entry = files_out[-1]["path"]
+
+    dependencies = []
+    for value in plan.get("dependencies", [])[:MAX_AGENT_DEPENDENCIES]:
+        dependency = str(value).strip()
+        if dependency and _SAFE_DEPENDENCY.fullmatch(dependency):
+            dependencies.append(dependency)
+
+    project_name = re.sub(r"[^\w\-]", "_", str(plan.get("project_name", "jarvis_project")))[:64]
+    return {
+        "project_name": project_name or "jarvis_project",
+        "entry_point": entry,
+        "files": files_out,
+        "run_command": str(plan.get("run_command", f"python {entry}"))[:400],
+        "dependencies": dependencies,
+    }
 
 
 def _parse_traceback(output: str, project_files: list[str]) -> tuple[str | None, int | None]:
@@ -225,7 +295,7 @@ Code for {file_path}:"""
         response = model.generate_content(prompt)
         code = _strip_fences(response.text)
 
-        full_path = project_dir / file_path
+        full_path = _safe_project_path(project_dir, file_path)
         full_path.parent.mkdir(parents=True, exist_ok=True)
         full_path.write_text(code, encoding="utf-8")
 
@@ -423,7 +493,7 @@ Fixed code for {fix_path}:"""
             response = model.generate_content(prompt)
             fixed = _strip_fences(response.text)
 
-            full_path = project_dir / fix_path
+            full_path = _safe_project_path(project_dir, fix_path)
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(fixed, encoding="utf-8")
 
@@ -453,7 +523,7 @@ def _build_project(
 
     log("Planning project structure...")
     try:
-        plan = _plan_project(description, language)
+        plan = _validate_plan(_plan_project(description, language))
     except RateLimitError:
         msg = "Rate limit reached, sir. Please try again in a moment."
         if speak: speak(msg)
