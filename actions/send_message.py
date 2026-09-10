@@ -4,13 +4,19 @@ import sys
 import time
 from pathlib import Path
 
-try:
-    import pyautogui
-    pyautogui.FAILSAFE = True
-    pyautogui.PAUSE    = 0.06
-    _PYAUTOGUI = True
-except ImportError:
-    _PYAUTOGUI = False
+# Deferred: pyautogui costs ~94 MB on macOS and typing a message is rare
+# next to the number of sessions that never touch it.
+from core.lazy_import import LazyModule, available
+
+
+def _configure(mod):
+    mod.FAILSAFE = True
+    mod.PAUSE = 0.06        # slightly slower than elsewhere: Messages drops
+                            # keystrokes typed faster than this
+
+
+pyautogui = LazyModule("pyautogui", _configure)
+_PYAUTOGUI = available("pyautogui")
 
 try:
     import pyperclip

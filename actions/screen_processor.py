@@ -14,11 +14,13 @@ from typing import Optional
 import numpy as np
 import sounddevice as sd
 
-try:
-    import cv2
-    _CV2 = True
-except ImportError:
-    _CV2 = False
+# cv2 costs ~28 MB and is only needed when a camera frame is actually
+# grabbed. main.py imports this module at startup for _capture_screen, which
+# does not touch OpenCV at all, so loading it eagerly taxed every session for
+# a code path most of them never reach.
+from core.lazy_import import LazyModule, available
+cv2 = LazyModule("cv2")
+_CV2 = available("cv2")
 
 try:
     import mss
@@ -35,6 +37,7 @@ except ImportError:
 
 from google import genai
 from google.genai import types as gtypes
+from core import models
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -47,17 +50,18 @@ _CONFIG_PATH = _BASE / "config" / "api_keys.json"
 
 
 def _load_config() -> dict:
-    try:
-        return json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    # Shared mtime-keyed cache: an edit is still picked up on the next
+    # call, but a screen frame no longer costs an open+parse per lookup.
+    return models.config()
 
 
 def _save_config_key(key: str, value) -> None:
     try:
         cfg = _load_config()
+        cfg = dict(cfg)
         cfg[key] = value
         _CONFIG_PATH.write_text(json.dumps(cfg, indent=4), encoding="utf-8")
+        models.invalidate()
     except Exception as e:
         print(f"[Vision] ⚠️  Could not save config key '{key}': {e}")
 
@@ -72,7 +76,7 @@ def _get_api_key() -> str:
 def _get_os() -> str:
     return _load_config().get("os_system", "windows").lower()
 
-_LIVE_MODEL         = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+_LIVE_MODEL         = models.for_task("live")
 _CHANNELS           = 1
 _RECEIVE_SAMPLE_RATE = 24_000
 _CHUNK_SIZE         = 1_024
@@ -177,6 +181,19 @@ def _capture_camera() -> tuple[bytes, str]:
     if not _CV2:
         raise RuntimeError("OpenCV (cv2) is not installed. Run: pip install opencv-python")
 
+    # The gesture engine keeps the webcam open so a clap can summon the UI from
+    # cold; borrow it for this capture rather than fighting it for the handle.
+    try:
+        from core.gestures import camera_lease
+    except Exception:
+        import contextlib
+        camera_lease = contextlib.nullcontext
+
+    with camera_lease():
+        return _capture_camera_frame()
+
+
+def _capture_camera_frame() -> tuple[bytes, str]:
     index   = _get_camera_index()
     backend = _cv2_backend()
     cap     = cv2.VideoCapture(index, backend)

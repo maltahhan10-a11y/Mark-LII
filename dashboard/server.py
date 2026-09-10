@@ -20,9 +20,9 @@ from pathlib import Path
 
 _DEPS_OK = False
 try:
-    from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-    from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
-    import uvicorn
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request  # pyright: ignore[reportMissingImports]
+    from fastapi.responses import HTMLResponse, JSONResponse, FileResponse  # pyright: ignore[reportMissingImports]
+    import uvicorn  # pyright: ignore[reportMissingImports]
     _DEPS_OK = True
 except ImportError:
     pass
@@ -30,7 +30,7 @@ except ImportError:
 # python-multipart is required for file uploads — optional dependency
 _UPLOAD_OK = False
 try:
-    from fastapi import UploadFile, File as FastAPIFile
+    from fastapi import UploadFile, File as FastAPIFile  # pyright: ignore[reportMissingImports]
     _UPLOAD_OK = True
 except Exception:
     pass
@@ -80,11 +80,16 @@ def _derive_key(session_key: str) -> bytes:
 
 def _decrypt_cbc(aes_key: bytes, enc_b64: str) -> str:
     """Decrypt base64(IV[16] ‖ ciphertext) with AES-256-CBC + PKCS7."""
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    from cryptography.hazmat.primitives import padding as sym_pad
+        # Keep this optional and lazy: the dashboard can run without cryptography
+        # until an encrypted request is received.
+    from importlib import import_module
+    ciphers = import_module("cryptography.hazmat.primitives.ciphers")
+    sym_pad = import_module("cryptography.hazmat.primitives.ciphers.padding")
     raw      = base64.b64decode(enc_b64)
     iv, ct   = raw[:16], raw[16:]
-    dec      = Cipher(algorithms.AES(aes_key), modes.CBC(iv)).decryptor()
+    dec      = ciphers.Cipher(
+            ciphers.algorithms.AES(aes_key), ciphers.modes.CBC(iv)
+        ).decryptor()
     padded   = dec.update(ct) + dec.finalize()
     unpadder = sym_pad.PKCS7(128).unpadder()
     return (unpadder.update(padded) + unpadder.finalize()).decode('utf-8')

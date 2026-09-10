@@ -33,6 +33,10 @@ from PyQt6.QtWidgets import (
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
 )
 
+import overlay as _ov
+from overlay import FloatingOrb, ScreenGlow, ORB_SCALE_MIN, ORB_SCALE_MAX
+
+
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
@@ -49,6 +53,18 @@ def _read_full_config() -> dict:
         return json.loads(API_FILE.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def _write_config_key(key: str, value) -> None:
+    """Merge a single key into api_keys.json. Silent on failure — nothing here
+    is important enough to interrupt the UI for."""
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        cfg = _read_full_config()
+        cfg[key] = value
+        API_FILE.write_text(json.dumps(cfg, indent=4), encoding="utf-8")
+    except Exception:
+        pass
 
 
 _DEFAULT_W, _DEFAULT_H = 980, 700
@@ -369,6 +385,12 @@ class HudCanvas(QWidget):
         # (0.0–1.0), _amp_disp is the smoothed value the paint code reads.
         self._live_amp  = 0.0
         self._amp_disp  = 0.0
+
+        # Gesture readiness, mirrored from the orb so both surfaces say the
+        # same thing (see MainWindow._on_hand_state).
+        self.hands_seen = 0
+        self.hand_pose  = ""
+        self._hand_tint = 0.0
         self._base_scale = 1.0    # slow "breathing" target; amp is added per-frame
         self._base_halo  = 55.0
 
@@ -476,6 +498,9 @@ class HudCanvas(QWidget):
             [p[0]+p[2], p[1]+p[3], p[2]*0.97, p[3]*0.97, p[4]-0.028]
             for p in self._particles if p[4] > 0
         ]
+
+        tgt_tint = (1.0 if self.hands_seen else 0.0) + (0.6 if self.hand_pose else 0.0)
+        self._hand_tint += (tgt_tint - self._hand_tint) * 0.10
 
         self._blink_tick += 1
         if self._blink_tick >= 38:
@@ -649,7 +674,69 @@ class HudCanvas(QWidget):
                     cl = qcol(C.BORDER_B)
             p.fillRect(QRectF(wx0 + i * bw, wy + 20 - hgt, bw - 1, hgt), cl)
 
+        self._paint_frame(p, W, H)
+
         p.end()   # end deterministically so the backing store never flushes an active painter
+
+    def _paint_frame(self, p: QPainter, W: int, H: int) -> None:
+        """Corner brackets, and the same aurora that rims the floating orb.
+
+        The hub gets the listening indicator too, so the two surfaces read as
+        one instrument rather than two different apps.
+        """
+        from PyQt6.QtGui import QConicalGradient as _QCG, QImage as _QImg
+
+        listening = self.state in ("LISTENING", "THINKING") and not self.muted
+        power = ((0.34 if listening else 0.0)
+                 + (0.42 if self.speaking else 0.0)
+                 + 0.5 * self._amp_disp)
+        if power > 0.02 and W > 8 and H > 8:
+            scale = min(1.0, 360.0 / max(W, H))
+            lw, lh = max(int(W * scale), 8), max(int(H * scale), 8)
+            layer = _QImg(lw, lh, _QImg.Format.Format_ARGB32_Premultiplied)
+            layer.fill(Qt.GlobalColor.transparent)
+            lp = QPainter(layer)
+            stops = _ov.aurora_ribbon(C.PRI)
+            grad = _QCG(QPointF(lw / 2, lh / 2), -(self._tick * 0.35) % 360)
+            for i, col in enumerate(stops + [stops[0]]):
+                grad.setColorAt(min(i / len(stops), 1.0), col)
+            lp.fillRect(0, 0, lw, lh, grad)
+            lp.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+            lp.drawImage(0, 0, ScreenGlow._edge_mask(lw, lh, 34.0 * scale * (0.8 + power)))
+            lp.end()
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            p.setOpacity(min(0.85, power))
+            p.drawImage(QRectF(0, 0, W, H), layer)
+            p.setOpacity(1.0)
+
+        # Corner brackets — the fixed frame the aurora breathes against. They
+        # brighten and grow while the camera has a hand, which is the hub's
+        # version of the orb's readiness collar.
+        tint = min(self._hand_tint, 1.6)
+        arm, off = int(34 + 14 * tint), 10
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(qcol(C.PRI, int(190 + 40 * min(tint, 1.0))), 1.6 + 1.0 * tint))
+        for sx, sy, ax, ay in (
+            (off, off, 1, 1), (W - off, off, -1, 1),
+            (off, H - off, 1, -1), (W - off, H - off, -1, -1),
+        ):
+            p.drawLine(QPointF(sx, sy), QPointF(sx + arm * ax, sy))
+            p.drawLine(QPointF(sx, sy), QPointF(sx, sy + arm * ay))
+        p.setPen(QPen(qcol(C.PRI_DIM, 130), 1.0))
+        for sx, sy, ax, ay in (
+            (off + 6, off + 6, 1, 1), (W - off - 6, off + 6, -1, 1),
+            (off + 6, H - off - 6, 1, -1), (W - off - 6, H - off - 6, -1, -1),
+        ):
+            p.drawLine(QPointF(sx, sy), QPointF(sx + 14 * ax, sy))
+            p.drawLine(QPointF(sx, sy), QPointF(sx, sy + 14 * ay))
+
+        if self._hand_tint > 0.02:
+            label = (self.hand_pose or "hand ready").upper()
+            p.setPen(qcol(C.PRI, int(230 * min(self._hand_tint, 1.0))))
+            p.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+            p.drawText(QRectF(off + 4, H - off - 20, 220, 14),
+                       Qt.AlignmentFlag.AlignLeft, f"✋ {label}")
+
 
 class MetricBar(QWidget):
 
@@ -2376,6 +2463,172 @@ class RemoteKeyOverlay(QWidget):
         self.closed.emit()
 
 
+class _SettingsDial:
+    """Applies volume and brightness steps from the finger dials.
+
+    Several of these calls shell out — osascript, powershell, brightnessctl —
+    and cost the better part of a tenth of a second, so none of it may happen
+    on the GUI thread or on the camera thread. Steps that arrive faster than
+    they can be applied are *coalesced*, not queued: a fast sweep should land
+    on the value your hand ended at, not replay every step it passed through
+    on the way.
+    """
+
+    # Percent applied per dial step, per channel.
+    STEPS = {"volume": 4, "brightness": 6}
+    REREAD = 3.0             # seconds before a cached level is distrusted
+
+    def __init__(self, on_feedback=None):
+        self._on_feedback = on_feedback
+        self._pending = {"volume": 0, "brightness": 0}
+        self._level: dict[str, int | None] = {"volume": None, "brightness": None}
+        self._read_at = {"volume": 0.0, "brightness": 0.0}
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._thread = threading.Thread(
+            target=self._loop, name="markii-dial", daemon=True
+        )
+        self._thread.start()
+
+    def step(self, kind: str, direction: int) -> None:
+        """Thread-safe: called from the gesture worker via a queued signal."""
+        if kind not in self._pending:
+            return
+        with self._lock:
+            self._pending[kind] += direction
+        self._wake.set()
+
+    def _take(self, kind: str) -> int:
+        with self._lock:
+            n, self._pending[kind] = self._pending[kind], 0
+        return n
+
+    def _loop(self) -> None:
+        while True:
+            self._wake.wait()
+            self._wake.clear()
+            for kind in ("volume", "brightness"):
+                try:
+                    self._apply(kind, self._take(kind))
+                except Exception as exc:
+                    print(f"[Dial] {kind}: {exc}")
+
+    @staticmethod
+    def _channel(kind: str):
+        from actions import computer_settings as cs
+        if kind == "volume":
+            return cs.volume_get, cs.volume_set, cs.volume_up, cs.volume_down
+        return cs.brightness_get, cs.brightness_set, cs.brightness_up, cs.brightness_down
+
+    def _apply(self, kind: str, steps: int) -> None:
+        """Move one channel by `steps`, absolutely where the level can be read.
+
+        Reading first means a sweep lands on an exact value and the two
+        directions are symmetric — the OS media keys are neither. Where the
+        platform will not report a level we fall back to the relative keys and
+        say only which way it went.
+        """
+        if not steps:
+            return
+        get, set_, up, down = self._channel(kind)
+
+        now = time.time()
+        if self._level[kind] is None or now - self._read_at[kind] > self.REREAD:
+            self._level[kind] = get()
+        if self._level[kind] is None:
+            for _ in range(min(abs(steps), 6)):
+                (up if steps > 0 else down)()
+            self._feedback(f"{kind} {'up' if steps > 0 else 'down'}")
+            return
+
+        value = max(0, min(100, self._level[kind] + steps * self.STEPS[kind]))
+        self._level[kind] = value
+        self._read_at[kind] = now
+        set_(value)
+        self._feedback(f"{kind} {value}%")
+
+    def _feedback(self, text: str) -> None:
+        if self._on_feedback:
+            try:
+                self._on_feedback(text)
+            except Exception:
+                pass
+
+
+class _Spotlight(QWidget):
+    """A fading aurora outline drawn over whichever section was asked for.
+
+    It is a sibling overlay that never touches the target's stylesheet or the
+    layout, so pointing at a panel cannot disturb what that panel does.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.hide()
+        self._life = 0.0
+        self._phase = 0.0
+        self._label = ""
+        self._tmr = QTimer(self)
+        self._tmr.timeout.connect(self._step)
+
+    def point_at(self, widget: QWidget, label: str = "") -> None:
+        if widget is None or not widget.isVisible():
+            return
+        tl = widget.mapTo(self.parentWidget(), QPointF(0, 0).toPoint())
+        pad = 5
+        self.setGeometry(
+            tl.x() - pad, tl.y() - pad,
+            widget.width() + pad * 2, widget.height() + pad * 2,
+        )
+        self._label = label.upper()
+        self._life = 1.0
+        self.show()
+        self.raise_()
+        if not self._tmr.isActive():
+            self._tmr.start(16)
+
+    def _step(self):
+        self._phase = (self._phase + 0.012) % 1.0
+        self._life -= 0.006          # ~2.7s from full to gone
+        if self._life <= 0:
+            self._tmr.stop()
+            self.hide()
+            return
+        self.update()
+
+    def paintEvent(self, _):
+        if self._life <= 0:
+            return
+        p = QPainter(self)
+        if not p.isActive():
+            return
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        fade = min(1.0, self._life * 2.2)   # hold, then fall away
+
+        stops = _ov.aurora_ribbon(C.PRI)
+        grad = QConicalGradient(QPointF(W / 2, H / 2), -self._phase * 360.0)
+        for i, col in enumerate(stops + [stops[0]]):
+            grad.setColorAt(min(i / len(stops), 1.0), col)
+        for i, (width, alpha) in enumerate(((5.0, 0.16), (2.4, 0.55), (1.2, 1.0))):
+            p.setOpacity(alpha * fade)
+            p.setPen(QPen(grad, width))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            inset = width / 2 + 1
+            p.drawRoundedRect(
+                QRectF(inset, inset, W - inset * 2, H - inset * 2), 6, 6
+            )
+        if self._label:
+            p.setOpacity(fade)
+            p.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+            p.setPen(qcol(C.PRI, 235))
+            p.drawText(QRectF(8, 2, W - 16, 14),
+                       Qt.AlignmentFlag.AlignLeft, f"◈ {self._label}")
+        p.setOpacity(1.0)
+        p.end()
+
+
 class MainWindow(QMainWindow):
     _log_sig        = pyqtSignal(str)
     _state_sig      = pyqtSignal(str)
@@ -2387,6 +2640,17 @@ class MainWindow(QMainWindow):
     _clipboard_sig  = pyqtSignal(str)        # clipboard text changed (thread-safe)
     _confirm_sig    = pyqtSignal(str, str)   # (title, detail) — irreversible-action gate
     _confirm_hide_sig = pyqtSignal()
+    _hub_sig        = pyqtSignal(str, str)   # (action, section) — hub window
+    _agent_done_sig = pyqtSignal(str, str)   # agent key, result
+    _orb_sig        = pyqtSignal(str)        # show|hide|expand|minimize|toggle — orb
+    _gesture_sig    = pyqtSignal(str, str)   # (gesture, detail) — from the camera thread
+    _drag_sig       = pyqtSignal(int, int)   # pinch-drag delta in pixels
+    _dial_sig       = pyqtSignal(str, int)   # (volume|brightness, +1/-1)
+    _dial_fb_sig    = pyqtSignal(str)        # dial feedback, from its worker
+    _hand_sig       = pyqtSignal(int, str)   # (hands seen, pose) — gesture readiness
+    _hold_sig       = pyqtSignal(str, bool)  # (held gesture, active) — e.g. fist-mute
+    _resize_sig     = pyqtSignal(float)      # two-hand pinch: orb size ratio
+    _sleep_sig      = pyqtSignal(bool)       # True = sleep, False = wake
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -2420,6 +2684,11 @@ class MainWindow(QMainWindow):
         self._confirm_overlay  = None   # live ConfirmBanner, if one is on screen
         self.get_plugins       = None   # callable: () -> list[dict], set by JarvisLive
         self._muted            = False
+        # True only while the fist gesture owns the mute, so releasing
+        # the fist never undoes a mute the user set deliberately.
+        self._fist_muted       = False
+        self._active_section   = "overview"
+        self._section_btns: dict[str, QPushButton] = {}
         self._current_file: str | None = None
         self._remote_overlay: RemoteKeyOverlay | None = None
         self._customize_overlay: CustomizeOverlay | None = None
@@ -2526,6 +2795,17 @@ class MainWindow(QMainWindow):
 
         self._log_sig.connect(self._log.append_log)
         self._state_sig.connect(self._apply_state)
+        self._hub_sig.connect(self._apply_hub)
+        self._agent_done_sig.connect(self._on_agent_done)
+        self._orb_sig.connect(self._apply_orb)
+        self._gesture_sig.connect(self._on_gesture)
+        self._drag_sig.connect(self._on_gesture_drag)
+        self._dial_sig.connect(self._on_gesture_dial)
+        self._dial_fb_sig.connect(self._on_dial_feedback)
+        self._hand_sig.connect(self._on_hand_state)
+        self._hold_sig.connect(self._on_gesture_hold)
+        self._resize_sig.connect(self._on_gesture_resize)
+        self._sleep_sig.connect(self._apply_sleep)
         self._content_sig.connect(self._show_content)
         self._reconfig_sig.connect(self._show_setup)
         self._camera_sig.connect(self._show_camera_frame)
@@ -2538,6 +2818,10 @@ class MainWindow(QMainWindow):
 
         # Camera preview overlay (child of central widget, positioned in resizeEvent)
         self._cam_preview = _CameraPreview(self.centralWidget())
+
+        # Section spotlight (child of central widget, positioned on demand)
+        self._spotlight = _Spotlight(self.centralWidget())
+        self._sync_section_rail()
 
         # Clipboard panel (child of central widget, bottom-center)
         self._clipboard_panel = ClipboardPanel(self.centralWidget())
@@ -2555,6 +2839,596 @@ class MainWindow(QMainWindow):
         sc_full.activated.connect(self._toggle_fullscreen)
         sc_intr = QShortcut(QKeySequence("Escape"), self)
         sc_intr.activated.connect(self._do_interrupt)
+
+        # ── The floating layer ────────────────────────────────────────────
+        # MARK LII lives as an orb, not as a window. The hub (this window) is
+        # only raised when it is asked for; everything the assistant actually
+        # does runs through JarvisLive, which never touches these widgets.
+        self.on_wake = None            # callable: () -> None
+        # The aurora is an *engagement* indicator, not a power light: it comes
+        # up when the assistant is woken and goes down when the exchange goes
+        # quiet. _awake_until is the deadline it fades at.
+        self._awake = False
+        self._awake_until = 0.0
+        self.orb = FloatingOrb(self._assistant_name)
+        self.glow = ScreenGlow()
+        self.orb.hub_toggled.connect(lambda: self._apply_hub("toggle", ""))
+        self.orb.wake_requested.connect(self._do_wake)
+        self.orb.mute_toggled.connect(self._toggle_mute)
+        self.orb.interrupt_requested.connect(self._do_interrupt)
+        self.orb.quit_requested.connect(self._quit_everything)
+        self.orb.position_changed.connect(
+            lambda x, y: _write_config_key("orb_pos", [x, y])
+        )
+        self.orb.agent_run_requested.connect(self._on_agent_run)
+        self.orb.expanded_changed.connect(
+            lambda v: _write_config_key("orb_expanded", bool(v))
+        )
+        self._log_sig.connect(self.orb.push_log)
+        self._restore_orb_position()
+        self.orb.show()
+        cfg0 = _read_full_config()
+        if cfg0.get("orb_expanded"):
+            self.orb.set_expanded(True)
+        try:
+            saved_scale = float(cfg0.get("orb_scale", 1.0))
+        except (TypeError, ValueError):
+            saved_scale = 1.0
+        if saved_scale != 1.0:
+            self.orb.set_scale(saved_scale)
+        # Written on a timer rather than per frame: a resize gesture emits a
+        # ratio every frame it moves, and that must not become a file write
+        # every frame it moves.
+        self._orb_scale_save = QTimer(self)
+        self._orb_scale_save.setSingleShot(True)
+        self._orb_scale_save.setInterval(600)
+        self._orb_scale_save.timeout.connect(
+            lambda: _write_config_key("orb_scale", round(self.orb.scale(), 3))
+        )
+
+        self._awake_tmr = QTimer(self)
+        self._awake_tmr.timeout.connect(self._check_awake)
+        self._awake_tmr.start(500)
+
+        self._gesture_engine = None
+        self._dial: _SettingsDial | None = None   # built on the first dial step
+        QTimer.singleShot(1200, self._start_gestures)
+
+    # ------------------------------------------------------------------
+    # Floating layer: hub visibility, gestures, wake
+    # ------------------------------------------------------------------
+    def _restore_orb_position(self) -> None:
+        pos = _read_full_config().get("orb_pos")
+        scr = QApplication.primaryScreen().availableGeometry()
+        if isinstance(pos, list) and len(pos) == 2:
+            x, y = int(pos[0]), int(pos[1])
+        else:
+            x = scr.right() - self.orb.width() - 28
+            y = scr.bottom() - self.orb.height() - 40
+        self.orb.move(
+            max(scr.left(), min(x, scr.right() - self.orb.width())),
+            max(scr.top(), min(y, scr.bottom() - self.orb.height())),
+        )
+
+    AWAKE_TIMEOUT = 14.0    # seconds of quiet before the aurora fades out
+
+    # The hub's subsections. Each is either a panel already on screen (pointed
+    # at with the spotlight) or an overlay the hub raises. Voice, the header
+    # rail and the orb all go through this one table, so there is a single
+    # definition of what a section is.
+    SECTIONS = (
+        ("overview", "OVERVIEW", "The whole hub"),
+        ("monitor",  "MONITOR",  "CPU, memory, network, links"),
+        ("logs",     "LOGS",     "Activity log"),
+        ("files",    "FILES",    "Drop and process a file"),
+        ("content",  "CONTENT",  "Briefings and results"),
+        ("memory",   "MEMORY",   "What the assistant remembers"),
+        ("plugins",  "PLUGINS",  "Installed plugins"),
+        ("audio",    "AUDIO",    "Input and output devices"),
+        ("settings", "SETTINGS", "Name, voice, colour"),
+        ("remote",   "REMOTE",   "Phone pairing"),
+    )
+
+    @classmethod
+    def section_names(cls) -> list[str]:
+        return [key for key, _label, _desc in cls.SECTIONS]
+
+    def _open_section(self, name: str) -> None:
+        """Bring one subsection of the hub up. GUI thread only.
+
+        Panel sections spotlight what is already on screen; overlay sections
+        raise their overlay. Either way the hub is already visible by the time
+        this runs.
+        """
+        name = (name or "overview").strip().lower()
+        labels = {k: l for k, l, _d in self.SECTIONS}
+        if name not in labels:
+            # Never adopt a name that is not a section — the rail and
+            # hub_section would then be reporting something that isn't real.
+            self._log.append_log(
+                f"SYS: No hub section called '{name}'. "
+                f"Try: {', '.join(self.section_names())}."
+            )
+            return
+        label = labels[name]
+        self._active_section = name
+        self._sync_section_rail()
+
+        # Whatever the target, the previous section's overlay comes down
+        # first — otherwise it sits over the panel we are about to point at.
+        self._close_section_overlays()
+
+        panels = {
+            "monitor": self._left_panel,
+            "logs":    self._log,
+            "files":   self._drop_zone,
+            "content": self._content_panel,
+        }
+        if name == "content" and not self._content_panel.isVisible():
+            self._show_content("CONTENT", "Nothing to show yet.")
+
+        if name in panels:
+            self._spotlight.point_at(panels[name], label)
+            return
+
+        # An overlay takes the screen, so a spotlight still fading on some
+        # panel behind it would just be noise.
+        self._spotlight.hide()
+
+        if name == "audio":
+            # Enumerating host audio devices can take a while on macOS and it
+            # blocks the GUI thread, so say what is happening first.
+            self._log.append_log("SYS: Scanning audio devices…")
+            QApplication.processEvents()
+
+        openers = {
+            "memory":   self._open_memory_panel,
+            "plugins":  self._open_plugin_manager,
+            "audio":    self._open_audio_devices,
+            "settings": self._open_customize,
+            "remote":   self._open_remote,
+        }
+        if name in openers:
+            openers[name]()
+
+    def _close_section_overlays(self) -> None:
+        """Take down any section overlay before raising another.
+
+        Only the section panels: a ConfirmBanner is a gate waiting on an
+        answer and a SetupOverlay is blocking first-run configuration, so
+        neither is ever dismissed from here.
+        """
+        kinds = (
+            MemoryOverlay, PluginManagerOverlay, AudioDeviceOverlay,
+            CustomizeOverlay, RemoteKeyOverlay,
+        )
+        cw = self.centralWidget()
+        if cw is None:
+            return
+        for child in cw.findChildren(QWidget):
+            if isinstance(child, kinds) and child.isVisible():
+                try:
+                    child.close()
+                except Exception:
+                    child.hide()
+
+    def _build_section_rail(self) -> QWidget:
+        """The row of subsection tabs in the header."""
+        w = QWidget()
+        w.setStyleSheet("background: transparent;")
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(3)
+        self._section_btns = {}
+        for key, label, desc in self.SECTIONS:
+            b = QPushButton(label)
+            b.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+            b.setFixedHeight(20)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setToolTip(desc)
+            b.clicked.connect(lambda _=False, k=key: self._open_section(k))
+            self._section_btns[key] = b
+            lay.addWidget(b)
+        return w
+
+    def _sync_section_rail(self) -> None:
+        """Restyle the rail so the live section reads as selected."""
+        for key, btn in getattr(self, "_section_btns", {}).items():
+            on = key == self._active_section
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    color: {C.PRI if on else C.TEXT_DIM};
+                    background: {C.PRI_GHO if on else 'transparent'};
+                    border: 1px solid {C.PRI_DIM if on else C.BORDER};
+                    border-radius: 3px; padding: 0 6px;
+                }}
+                QPushButton:hover {{ color: {C.PRI}; border-color: {C.PRI_DIM}; }}
+            """)
+
+
+    def _set_awake(self, awake: bool) -> None:
+        """Arm or disarm the engagement aurora."""
+        self._awake = bool(awake) and not self._muted
+        self._awake_until = time.time() + self.AWAKE_TIMEOUT if self._awake else 0.0
+        self._sync_glow()
+
+    def _touch_awake(self) -> None:
+        """Push the fade-out deadline back — the exchange is still live."""
+        if self._awake:
+            self._awake_until = time.time() + self.AWAKE_TIMEOUT
+
+    def _check_awake(self) -> None:
+        if self._awake and time.time() > self._awake_until:
+            self._set_awake(False)
+
+    def _sync_glow(self) -> None:
+        glow = getattr(self, "glow", None)
+        if glow is None:
+            return
+        glow.set_active(
+            self._awake and not self._muted,
+            speaking=(self.hud.state == "SPEAKING"),
+        )
+
+    def _apply_orb(self, action: str) -> None:
+        """show | hide | expand | minimize | toggle — GUI thread only."""
+        orb = self.orb
+        if action == "hide":
+            orb.set_hidden(True)
+        elif action == "show":
+            orb.set_hidden(False)
+        elif action == "expand":
+            orb.set_hidden(False)
+            orb.set_expanded(True)
+        elif action == "agents":
+            from actions import agents as _agents
+            orb.set_hidden(False)
+            orb.set_agents([(a.key, a.name, a.description)
+                            for a in _agents.catalogue()], True)
+        elif action in ("hide_agents", "close_agents"):
+            orb.hide_agents()
+        elif action in ("minimize", "minimise", "collapse"):
+            orb.set_expanded(False)
+            orb.hide_agents()
+        elif action == "toggle":
+            orb.set_hidden(orb.isVisible())
+        else:
+            orb.toggle_expanded()
+
+    def _on_agent_done(self, key: str, result: str) -> None:
+        """An agent finished. GUI thread only — the worker emits, never calls."""
+        try:
+            self.orb.set_agent_busy(key, False)
+        except Exception:
+            pass
+        self.write_log(f"Jarvis: {result}")
+
+    def _on_agent_run(self, key: str) -> None:
+        """A RUN button was pressed on the agent launcher.
+
+        The work happens on a worker thread: several of these agents take
+        minutes, and running one on the GUI thread would freeze the orb, the
+        overlay and the gesture feedback along with it.
+        """
+        from actions import agents as _agents
+
+        agent = _agents.get(key)
+        if agent is None:
+            return
+
+        # An agent that needs to be told what to do cannot be started by a
+        # button alone, so the button asks the question and hands the
+        # conversation back to the voice loop.
+        if agent.prompt:
+            # This one needs telling what to do, so the launcher gets out of
+            # the way and the question goes to the voice loop.
+            self.orb.hide_agents()
+            self.write_log(f"Jarvis: {agent.prompt}")
+            speak = getattr(self, "_speak_text", None) or getattr(self, "speak", None)
+            if callable(speak):
+                try:
+                    speak(agent.prompt)
+                except Exception:
+                    pass
+            return
+
+        # Leave the launcher open for these: the card turns to WORKING, which
+        # is the only feedback that the button did anything at all.
+        self.write_log(f"Jarvis: Running {agent.name.title()}.")
+        self.orb.set_agent_busy(key, True)
+
+        def work():
+            try:
+                out = _agents.run(key, "", self)
+            except Exception as exc:
+                out = f"{agent.name.title()} failed: {exc}"
+            try:
+                self._agent_done_sig.emit(key, str(out))
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True,
+                         name=f"agent-{key}").start()
+
+    def _apply_hub(self, action: str, section: str = "") -> None:
+        """Show/hide the hub, optionally landing on a section.
+
+        Runs on the GUI thread only.
+        """
+        want = {"show": True, "hide": False}.get(action, not self.isVisible())
+        if want:
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+            self._open_section(section or self._active_section)
+        else:
+            self.hide()
+        self.orb.hub_open = want
+        self.orb.flash_gesture("hub open" if want else "hub closed")
+
+    def closeEvent(self, e):
+        """Closing the hub hides it — the assistant keeps running in the orb.
+
+        Quitting for real goes through the orb's menu, the shutdown tool, or
+        the tray-less _quit_everything below.
+        """
+        e.ignore()
+        self.hide()
+        self.orb.hub_open = False
+        self._log.append_log("SYS: Hub closed — still listening. Say 'open the hub' to return.")
+
+    def _quit_everything(self) -> None:
+        try:
+            if self._gesture_engine is not None:
+                self._gesture_engine.stop()
+        except Exception:
+            pass
+        QApplication.instance().quit()
+        os._exit(0)
+
+    def _apply_sleep(self, asleep: bool) -> None:
+        """Go off duty, or come back. GUI thread only.
+
+        Sleeping mutes the microphone, which is the point — but it also means
+        no voice command can wake it again, because nothing is listening. The
+        ways back are a clap, a pinch tap, the orb, or F4. Every integration,
+        watch and timer keeps running throughout; this is only about whether
+        the assistant is taking input.
+        """
+        if not asleep:
+            self._do_wake()
+            return
+
+        if not self._muted:
+            self._muted = True
+            self.hud.muted = True
+            self._sync_mute_to_orb()
+            self._style_mute_btn()
+        self._set_awake(False)
+        self._apply_state("SLEEPING")
+        self.orb.flash_gesture("sleeping")
+        self._log.append_log(
+            "SYS: Sleeping. Clap, pinch-tap, click the orb or press F4 to wake me."
+        )
+
+    def _do_wake(self) -> None:
+        if self._muted:
+            self._toggle_mute()
+        self._apply_state("LISTENING")
+        self._set_awake(True)
+        self.orb.flash_gesture("awake")
+        if self.on_wake:
+            threading.Thread(target=self.on_wake, daemon=True).start()
+
+    def _authorise_camera(self) -> None:
+        """Open the camera once on the GUI thread so macOS can ask the user.
+
+        Cheap and idempotent: after the grant exists this is a fraction of a
+        second, and if the user refuses, the gesture engine still starts and
+        simply reports that it has no camera.
+        """
+        try:
+            import cv2
+        except Exception:
+            return
+        try:
+            cam = int(get_camera_index()) if callable(globals().get("get_camera_index")) else 0
+        except Exception:
+            cam = 0
+        cap = None
+        try:
+            cap = cv2.VideoCapture(cam, cv2.CAP_AVFOUNDATION)
+            if cap.isOpened():
+                cap.read()
+                print("[Gestures] Camera authorised.")
+            else:
+                print("[Gestures] Camera not authorised yet — "
+                      "allow it in System Settings > Privacy & Security > Camera.")
+        except Exception as exc:
+            print(f"[Gestures] Camera check failed: {exc}")
+        finally:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+
+    def _start_gestures(self) -> None:
+        """Arm bare-hand control. Failure here is never fatal — the orb, the
+        hub and every integration work exactly the same without a camera."""
+        try:
+            from core.gestures import GestureEngine, set_engine
+        except Exception as exc:
+            print(f"[Gestures] Not available: {exc}")
+            return
+
+        # Ask for the camera here, on the Qt main thread, before the engine's
+        # worker wants it. macOS raises the permission dialog on the main run
+        # loop only; OpenCV attempting it from the capture thread fails with
+        # "can not spin main run loop from other thread" and the camera never
+        # initialises. Running from a terminal hid this, because the terminal
+        # already held the grant -- a fresh .app bundle is a new identity to
+        # TCC and starts with nothing.
+        self._authorise_camera()
+        # Gesture deltas arrive in barehands' isotropic width units. Convert
+        # them to pixels here, on the GUI thread, and capture the factor: the
+        # callbacks below run on the camera worker, which must not touch Qt
+        # beyond emitting a queued signal.
+        _px = QApplication.primaryScreen().geometry().width() * 1.6
+
+        eng = GestureEngine(
+            on_gesture=lambda name, meta: self._gesture_sig.emit(
+                name, str(meta.get("direction") or meta.get("via") or "")
+            ),
+            on_drag=lambda dx, dy: self._drag_sig.emit(int(dx * _px), int(dy * _px)),
+            on_dial=lambda kind, direction: self._dial_sig.emit(kind, direction),
+            on_presence=lambda n, pose: self._hand_sig.emit(n, pose),
+            on_hold=lambda name, active: self._hold_sig.emit(name, bool(active)),
+            on_resize=lambda ratio: self._resize_sig.emit(float(ratio)),
+        )
+        if eng.start():
+            self._gesture_engine = eng
+            set_engine(eng)
+            self._log.append_log(
+                "SYS: Bare-hand control armed — clap: wake / hub, palm swipe: "
+                "hide, pinch tap: wake, palm push: stop, pinch-drag: move the "
+                "orb, two fingers + thumb out turned like a knob: volume, "
+                "two fingers + thumb tucked slid up-down: brightness, "
+                "closed fist: hold to mute, both hands pinched and pulled "
+                "apart: resize the orb."
+            )
+        elif eng.last_error:
+            self._log.append_log(f"SYS: Gesture control off ({eng.last_error}).")
+
+    def _asleep(self) -> bool:
+        """Is the assistant off duty rather than merely idle?"""
+        return self._muted or self.hud.state in (
+            "SLEEPING", "MUTED", "INITIALISING",
+        )
+
+    def _on_gesture(self, name: str, detail: str) -> None:
+        """Map a detected gesture onto an action. GUI thread."""
+        if name == "summon":
+            # A clap means "attend to me". If the assistant is asleep or muted
+            # that means wake it; if it is already listening there is nothing
+            # to wake, so the clap brings the hub up instead.
+            if self._asleep():
+                self.orb.flash_gesture("clap — waking")
+                self._do_wake()
+            else:
+                self._apply_hub("show")
+        elif name == "dismiss":
+            # The swipe has always known which way it went — the direction was
+            # computed and then thrown away. Right opens outward, left folds
+            # back, and hiding the hub stays where it was: what a left swipe
+            # does once there is nothing left to close.
+            self._swipe_panels(detail)
+        elif name == "wake":
+            self._do_wake()
+        elif name == "halt":
+            self.orb.flash_gesture("halt")
+            self._do_interrupt()
+
+    def _swipe_panels(self, direction: str) -> None:
+        """Open or fold the orb's panels with a sideways palm swipe."""
+        orb = getattr(self, "orb", None)
+        if orb is None:
+            self._apply_hub("hide")
+            return
+
+        if direction == "right":
+            if not orb.expanded and not orb.agents_mode:
+                orb.flash_gesture("swipe — panel")
+                self._apply_orb("expand")
+            elif orb.expanded and not orb.agents_mode:
+                orb.flash_gesture("swipe — agents")
+                self._apply_orb("agents")
+            else:
+                orb.flash_gesture("already open")
+            return
+
+        # Left: undo the last thing the right swipe opened, one layer at a
+        # time, so a person can always get back to a bare orb by repeating it.
+        if orb.agents_mode:
+            # Back to the status panel, not straight to a bare orb. Opening
+            # the agents view clears `expanded` because the two share the same
+            # space, so unwinding has to put it back deliberately or the left
+            # swipe skips a rung the right swipe climbed.
+            orb.flash_gesture("swipe — back to panel")
+            self._apply_orb("hide_agents")
+            self._apply_orb("expand")
+        elif orb.expanded:
+            orb.flash_gesture("swipe — minimise")
+            self._apply_orb("minimize")
+        else:
+            self._apply_hub("hide")
+
+    def _on_gesture_drag(self, dx: int, dy: int) -> None:
+        self.orb.nudge(dx, dy)
+
+    def _on_gesture_resize(self, ratio: float) -> None:
+        """Two pinched hands moving apart or together resize the orb."""
+        orb = getattr(self, "orb", None)
+        if orb is None:
+            return
+        before = orb.scale()
+        after = orb.scale_by(ratio)
+        # Only announce when it actually moved, and only at the ends of the
+        # range, so a continuous resize does not spam the readout.
+        if after == before:
+            return
+        if after in (ORB_SCALE_MIN, ORB_SCALE_MAX):
+            orb.flash_gesture("smallest" if after == ORB_SCALE_MIN else "largest")
+        saver = getattr(self, "_orb_scale_save", None)
+        if saver is not None:
+            saver.start()
+
+    def _on_gesture_hold(self, name: str, active: bool) -> None:
+        """A held gesture began or ended. GUI thread.
+
+        The fist mutes for as long as it is held. It only ever undoes its own
+        mute: if the microphone was already muted from the orb, the menu or a
+        key before the fist appeared, opening the hand leaves it muted, which
+        is what someone who deliberately muted expects.
+        """
+        if name != "mute":
+            return
+        if active:
+            self._fist_muted = not self._muted
+            if self._fist_muted:
+                self.orb.flash_gesture("fist — mic off")
+                self._toggle_mute()
+            return
+
+        if getattr(self, "_fist_muted", False):
+            self._fist_muted = False
+            if self._muted:
+                self.orb.flash_gesture("mic on")
+                self._toggle_mute()
+
+    def _on_hand_state(self, hands: int, pose: str) -> None:
+        """Gesture readiness from the camera worker. GUI thread.
+
+        Deliberately no position: see GestureEngine._emit_presence. All the
+        gestures are relative — a pinch-drag anywhere in frame moves the orb by
+        however far the hand travels — so what is worth showing is that the
+        camera has you, not a coordinate it cannot get right.
+        """
+        self.orb.set_hand_state(hands, pose)
+        self.hud.hands_seen = hands
+        self.hud.hand_pose = pose
+
+    def _on_gesture_dial(self, kind: str, direction: int) -> None:
+        """A finger-dial step. Hand it to the worker and return immediately —
+        applying it shells out, and this is the GUI thread."""
+        if self._dial is None:
+            self._dial = _SettingsDial(
+                on_feedback=lambda text: self._dial_fb_sig.emit(text)
+            )
+        self._dial.step(kind, direction)
+
+    def _on_dial_feedback(self, text: str) -> None:
+        self.orb.flash_gesture(text)
 
     def _show_camera_frame(self, img_bytes: bytes):
         """Slot — display camera preview overlay (main thread)."""
@@ -2595,8 +3469,10 @@ class MainWindow(QMainWindow):
         t.start()
 
     def _cam_loop(self) -> None:
+        lease = None
         try:
             import cv2
+            from core.gestures import camera_lease
             # Reuse camera index detected by screen_processor (cached in api_keys.json)
             cam_idx = 0
             try:
@@ -2609,6 +3485,10 @@ class MainWindow(QMainWindow):
                 backend = cv2.CAP_DSHOW if _OS == "Windows" else cv2.CAP_ANY
             except AttributeError:
                 backend = 0
+            # The gesture engine holds the webcam for the life of the process;
+            # borrow it for the duration of the stream and hand it straight back.
+            lease = camera_lease()
+            lease.__enter__()
             cap = cv2.VideoCapture(cam_idx, backend)
             if not cap.isOpened():
                 cap = cv2.VideoCapture(0)
@@ -2626,6 +3506,11 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"[Camera] Stream error: {e}")
         finally:
+            if lease is not None:
+                try:
+                    lease.__exit__(None, None, None)
+                except Exception:
+                    pass
             self._cam_stream_sig.emit(False)
 
     def stop_camera_stream(self) -> None:
@@ -3103,6 +3988,8 @@ class MainWindow(QMainWindow):
         self._drawer_btn.setCheckable(True)
         self._drawer_btn.clicked.connect(self._toggle_drawer)
         lay.addWidget(self._drawer_btn)
+        lay.addSpacing(10)
+        lay.addWidget(self._build_section_rail())
         lay.addStretch()
 
         mid = QVBoxLayout(); mid.setSpacing(1)
@@ -3193,6 +4080,103 @@ class MainWindow(QMainWindow):
         ip_lay.addWidget(os_lbl)
 
         lay.addWidget(info_panel)
+        lay.addSpacing(4)
+
+        # ── ACTIVE LINKS section ──
+        links_hdr = QLabel("◈ ACTIVE LINKS")
+        links_hdr.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        links_hdr.setStyleSheet(f"color: {C.PRI}; background: transparent; "
+                                f"border-bottom: 1px solid {C.BORDER}; padding-bottom: 4px;")
+        lay.addWidget(links_hdr)
+        lay.addSpacing(2)
+
+        _link_cfg = _read_full_config()
+        _integrations: list[tuple[str, str, str]] = []  # (name, dot_color, status)
+
+        # Spotify
+        _sp_id = _link_cfg.get("spotify_client_id", "")
+        _sp_sec = _link_cfg.get("spotify_client_secret", "")
+        if _sp_id and _sp_sec:
+            _integrations.append(("Spotify", C.GREEN, "LINKED"))
+        else:
+            _integrations.append(("Spotify", "#2a3a4c", "OFFLINE"))
+
+        # Google Calendar
+        if _link_cfg.get("google_calendar_enabled"):
+            _integrations.append(("Google Cal", C.GREEN, "LINKED"))
+        else:
+            _integrations.append(("Google Cal", "#2a3a4c", "OFFLINE"))
+
+        # Gmail
+        if _link_cfg.get("gmail_enabled"):
+            _integrations.append(("Gmail", C.GREEN, "LINKED"))
+        else:
+            _integrations.append(("Gmail", "#2a3a4c", "OFFLINE"))
+
+        # iMessage (macOS only)
+        if _OS == "Darwin":
+            _integrations.append(("iMessage", C.GREEN, "READY"))
+        else:
+            _integrations.append(("iMessage", "#2a3a4c", "OFFLINE"))
+
+        # Apple Notes (macOS only)
+        if _OS == "Darwin":
+            _integrations.append(("Apple Notes", C.GREEN, "READY"))
+        else:
+            _integrations.append(("Apple Notes", "#2a3a4c", "OFFLINE"))
+
+        # Todoist
+        if _link_cfg.get("todoist_api_key", ""):
+            _integrations.append(("Todoist", C.GREEN, "LINKED"))
+        else:
+            _integrations.append(("Todoist", "#2a3a4c", "OFFLINE"))
+
+        # Home Assistant
+        _ha_url = _link_cfg.get("home_assistant_url", "")
+        _ha_tok = _link_cfg.get("home_assistant_token", "")
+        if _ha_url and _ha_tok:
+            _integrations.append(("Home Asst", C.GREEN, "LINKED"))
+        else:
+            _integrations.append(("Home Asst", "#2a3a4c", "OFFLINE"))
+
+        links_panel = QWidget()
+        links_panel.setStyleSheet(
+            f"background: {C.PANEL2}; border: 1px solid {C.BORDER}; border-radius: 4px;"
+        )
+        lp_lay = QVBoxLayout(links_panel)
+        lp_lay.setContentsMargins(6, 5, 6, 5)
+        lp_lay.setSpacing(2)
+
+        for _int_name, _dot_col, _int_status in _integrations:
+            row = QWidget()
+            row.setStyleSheet("background: transparent; border: none;")
+            r_lay = QHBoxLayout(row)
+            r_lay.setContentsMargins(0, 1, 0, 1)
+            r_lay.setSpacing(4)
+
+            dot = QLabel("●")
+            dot.setFont(QFont("Courier New", 5))
+            dot.setFixedSize(10, 10)
+            dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            dot.setStyleSheet(f"color: {_dot_col}; background: transparent; border: none;")
+            r_lay.addWidget(dot)
+
+            name_lbl = QLabel(_int_name)
+            name_lbl.setFont(QFont("Courier New", 7))
+            name_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; border: none;")
+            r_lay.addWidget(name_lbl)
+
+            r_lay.addStretch()
+
+            st_lbl = QLabel(_int_status)
+            st_lbl.setFont(QFont("Courier New", 7))
+            _st_col = C.GREEN if _int_status in ("LINKED", "READY") else C.TEXT_DIM
+            st_lbl.setStyleSheet(f"color: {_st_col}; background: transparent; border: none;")
+            r_lay.addWidget(st_lbl)
+
+            lp_lay.addWidget(row)
+
+        lay.addWidget(links_panel)
         lay.addSpacing(4)
 
         lay.addStretch()
@@ -3930,12 +4914,15 @@ class MainWindow(QMainWindow):
     # ────────────────────────────────────────────────────────────────────────────
 
     def _do_interrupt(self):
+        # Interrupting ends the exchange, so the aurora goes down with it.
+        self._set_awake(False)
         if self.on_interrupt:
             self.on_interrupt()
 
     def _toggle_mute(self):
         self._muted = not self._muted
         self.hud.muted = self._muted
+        self._sync_mute_to_orb()
         self._style_mute_btn()
         if self._muted:
             self._apply_state("MUTED")
@@ -3943,6 +4930,15 @@ class MainWindow(QMainWindow):
         else:
             self._apply_state("LISTENING")
             self._log.append_log("SYS: Microphone active.")
+
+    def _sync_mute_to_orb(self):
+        orb = getattr(self, "orb", None)
+        if orb is not None:
+            orb.muted = self._muted
+        if self._muted:
+            self._set_awake(False)
+        else:
+            self._sync_glow()
 
     def _style_mute_btn(self):
         if self._muted:
@@ -3974,6 +4970,24 @@ class MainWindow(QMainWindow):
     def _apply_state(self, state: str):
         self.hud.state    = state
         self.hud.speaking = (state == "SPEAKING")
+        # The floating layer mirrors the same state, so the orb and the
+        # screen-edge aurora stay truthful while the hub is hidden.
+        orb = getattr(self, "orb", None)
+        if orb is not None:
+            orb.muted = self._muted
+            orb.set_state(state)
+        # THINKING means the assistant heard something and is acting on it —
+        # as good a wake signal as the gesture, and the only one this app gets
+        # without a dedicated hotword engine. Plain LISTENING is idle standby
+        # and deliberately does not light the aurora.
+        if state == "THINKING" and not self._muted:
+            self._set_awake(True)
+        elif state == "SPEAKING":
+            self._touch_awake()
+        if self._muted:
+            self._set_awake(False)
+        else:
+            self._sync_glow()
 
     def _check_config(self) -> bool:
         if not API_FILE.exists(): return False
@@ -4007,6 +5021,7 @@ class MainWindow(QMainWindow):
             self._overlay.hide()
             self._overlay = None
         self._apply_state("LISTENING")
+        self.orb.hub_open = True
         self._assistant_name = _read_full_config().get("assistant_name", "JARVIS") or "JARVIS"
         self._log.append_log(f"SYS: Initialised. OS={os_name.upper()}. {self._assistant_name} online.")
 
@@ -4020,12 +5035,83 @@ class _RootShim:
 
 
 class JarvisUI:
+    """The only surface JarvisLive talks to.
+
+    Nothing below depends on the hub window being visible: state, logs,
+    confirmations and content all land on widgets that exist whether or not
+    the window is on screen, so every integration and tool behaves identically
+    with the hub closed.
+    """
+
     def __init__(self, face_path: str, size=None):
         self._app = QApplication.instance() or QApplication(sys.argv)
         self._app.setStyle("Fusion")
+        # Closing the hub must not end the process — the orb is the app.
+        self._app.setQuitOnLastWindowClosed(False)
         self._win = MainWindow(face_path)
-        self._win.show()
+        # First run still needs the window: the API-key setup lives inside it.
+        if not self._win._ready:
+            self._win.show()
+            self._win.orb.hub_open = True
         self.root = _RootShim(self._app)
+
+    # ── hub visibility ──────────────────────────────────────────────────
+    def show_hub(self, section: str = "") -> None:
+        """Thread-safe: raise the hub, optionally landing on a subsection."""
+        self._win._hub_sig.emit("show", section or "")
+
+    def hide_hub(self) -> None:
+        """Thread-safe: drop back to the floating orb."""
+        self._win._hub_sig.emit("hide", "")
+
+    def toggle_hub(self, section: str = "") -> None:
+        self._win._hub_sig.emit("toggle", section or "")
+
+    @property
+    def hub_visible(self) -> bool:
+        return self._win.isVisible()
+
+    @property
+    def hub_sections(self) -> list[str]:
+        return MainWindow.section_names()
+
+    @property
+    def hub_section(self) -> str:
+        return self._win._active_section
+
+    # ── the floating orb ────────────────────────────────────────────────
+    def orb_action(self, action: str) -> None:
+        """Thread-safe: show | hide | expand | minimize | toggle."""
+        self._win._orb_sig.emit((action or "toggle").strip().lower())
+
+    @property
+    def orb_visible(self) -> bool:
+        return self._win.orb.isVisible()
+
+    @property
+    def orb_expanded(self) -> bool:
+        return self._win.orb.expanded
+
+    # ── sleep ───────────────────────────────────────────────────────────
+    def sleep(self) -> None:
+        """Thread-safe: mute and go off duty, without shutting anything down."""
+        self._win._sleep_sig.emit(True)
+
+    def wake(self) -> None:
+        """Thread-safe: come back on duty."""
+        self._win._sleep_sig.emit(False)
+
+    @property
+    def asleep(self) -> bool:
+        return self._win._asleep()
+
+    @property
+    def on_wake(self):
+        return self._win.on_wake
+
+    @on_wake.setter
+    def on_wake(self, cb):
+        self._win.on_wake = cb
 
     @property
     def muted(self) -> bool:
@@ -4103,6 +5189,12 @@ class JarvisUI:
         GIL, so no signal/lock is needed for this cosmetic value."""
         try:
             self._win.hud.set_audio_level(level)
+            self._win.orb.set_audio_level(level)
+            self._win.glow.set_audio_level(level)
+            # Sound extends a live exchange but never starts one, so ambient
+            # room noise cannot light the aurora on its own.
+            if level > 0.08:
+                self._win._touch_awake()
         except Exception:
             pass
 
@@ -4126,6 +5218,7 @@ class JarvisUI:
     def prompt_reconfig(self):
         """Thread-safe: show the API key setup overlay (e.g. after an auth error)."""
         self._win._ready = False
+        self._win._hub_sig.emit("show", "")
         self._win._reconfig_sig.emit()
 
     def show_camera_frame(self, img_bytes: bytes):

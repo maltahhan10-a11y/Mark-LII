@@ -1,9 +1,11 @@
 #web_search.py
 import json
+import importlib
 import sys
 import threading
 import time
 from pathlib import Path
+from core import models
 
 # ── Gemini grounding quota circuit breaker ────────────────────────────────────
 # The google_search grounding tool has its own small quota, separate from plain
@@ -87,7 +89,7 @@ def _gemini_search(query: str) -> str:
     client = genai.Client(api_key=_get_api_key())
     try:
         response = client.models.generate_content(
-            model="gemini-flash-latest",
+            model=models.for_task("search"),
             contents=query,
             config={"tools": [{"google_search": {}}]},
         )
@@ -114,16 +116,15 @@ def _get_ddgs():
     end up on it instead of failing in silence.
     """
     try:
-        from ddgs import DDGS
-        return DDGS
-    except ImportError:
-        from duckduckgo_search import DDGS
-        print(
-            "[WebSearch] ⚠️ Using the deprecated 'duckduckgo-search' package — "
-            "DuckDuckGo blocks its endpoints, so every search will come back "
-            "empty.  Fix with:  pip install -U ddgs"
-        )
-        return DDGS
+        # Import dynamically so environments that do not install the optional
+        # search backend can still import this module without an editor error.
+        DDGS = importlib.import_module("ddgs").DDGS
+    except ImportError as exc:
+        raise ImportError(
+            "The 'ddgs' package is required for web search. "
+            "Install it with: pip install -U ddgs"
+        ) from exc
+    return DDGS
 
 
 def _ddg_search(query: str, max_results: int = 6) -> list[dict]:
@@ -209,7 +210,7 @@ def _gemini_headlines(n: int = 5) -> tuple[list[str], str]:
 
     client = genai.Client(api_key=_get_api_key())
     response = client.models.generate_content(
-        model="gemini-flash-latest",
+        model=models.for_task("search"),
         contents=f"Current world news: {n} headlines. Numbered list, titles only.",
         config={"tools": [{"google_search": {}}]},
     )

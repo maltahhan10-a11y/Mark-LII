@@ -538,7 +538,14 @@ def get_disk_usage(path: str = "home") -> str:
         return f"Could not get disk usage: {e}"
 
 
-def organize_desktop() -> str:
+def organize(folder: str = "desktop", by: str = "type") -> str:
+    """Sort loose files in a folder into subfolders. Undoable in one step.
+
+    `by="type"` groups by what the file is; `by="date"` groups by the month it
+    was last modified, which is what a Downloads folder usually wants -- there
+    the useful question is "what did I get last week", not "which of these 400
+    files are PDFs".
+    """
     type_map = {
         "Images":    {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg", ".ico", ".heic"},
         "Documents": {".pdf", ".doc", ".docx", ".txt", ".xls", ".xlsx",
@@ -550,24 +557,40 @@ def organize_desktop() -> str:
                       ".cpp", ".java", ".cs", ".go", ".rs", ".sh"},
     }
 
-    desktop = _get_desktop()
+    target_root = _resolve_path(folder)
+    if not target_root.exists() or not target_root.is_dir():
+        return f"There is no folder at {target_root}."
+    if not _is_safe_path(target_root):
+        return f"I will not reorganise {target_root} — it is outside your home folder."
+    by = (by or "type").strip().lower()
+
+    label = target_root.name or str(target_root)
     moved, skipped = [], []
     journal: list[tuple[Path, Path]] = []   # (where it was, where it went)
 
     try:
-        for item in desktop.iterdir():
+        for item in target_root.iterdir():
             # Klasörlere, gizli dosyalara ve organize klasörlerine dokunma
             if item.is_dir() or item.name.startswith("."):
                 continue
             if item.name in {k for k in type_map}:
                 continue
 
-            ext        = item.suffix.lower()
-            target_dir = desktop / "Others"
-            for folder, exts in type_map.items():
-                if ext in exts:
-                    target_dir = desktop / folder
-                    break
+            if by == "date":
+                # Group by the month the file arrived. Anything undated falls
+                # back to type grouping rather than a folder called "Unknown".
+                try:
+                    stamp = datetime.fromtimestamp(item.stat().st_mtime)
+                    target_dir = target_root / stamp.strftime("%Y-%m %B")
+                except Exception:
+                    target_dir = target_root / "Others"
+            else:
+                ext        = item.suffix.lower()
+                target_dir = target_root / "Others"
+                for group, exts in type_map.items():
+                    if ext in exts:
+                        target_dir = target_root / group
+                        break
 
             target_dir.mkdir(exist_ok=True)
             new_path = target_dir / item.name
@@ -604,10 +627,10 @@ def organize_desktop() -> str:
                             folder.rmdir()
                     except Exception:
                         pass
-                return f"{restored} file(s) put back on the desktop."
-            push_undo(f"organized the desktop ({len(journal)} files)", _undo_organize)
+                return f"{restored} file(s) put back."
+            push_undo(f"organised {label} ({len(journal)} files)", _undo_organize)
 
-        result = f"Desktop organized: {len(moved)} files moved."
+        result = f"{label} organised: {len(moved)} files moved."
         if moved:
             preview = moved[:8]
             result += "\n" + "\n".join(preview)
@@ -618,7 +641,12 @@ def organize_desktop() -> str:
         return result
 
     except Exception as e:
-        return f"Could not organize desktop: {e}"
+        return f"Could not organise {label}: {e}"
+
+
+def organize_desktop() -> str:
+    """Kept so existing callers and saved phrasings keep working."""
+    return organize("desktop", "type")
 
 
 def get_file_info(path: str, name: str = "") -> str:
@@ -708,8 +736,11 @@ def file_controller(
         elif action == "disk_usage":
             return get_disk_usage(path)
 
-        elif action == "organize_desktop":
-            return organize_desktop()
+        elif action in ("organize", "organize_desktop", "organise", "tidy", "sort"):
+            # "organize_desktop" stays valid; the folder now comes from the
+            # same 'path' argument every other action already uses.
+            where = path or ("desktop" if action == "organize_desktop" else "downloads")
+            return organize(where, params.get("by", "type"))
 
         elif action == "info":
             return get_file_info(path, name=name)

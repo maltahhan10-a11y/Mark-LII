@@ -142,13 +142,24 @@ def check_all() -> list[str]:
 
             snippet = top.get("snippet", "")[:150]
             source  = top.get("source", "")
-            parts   = [f"[MONITOR_ALERT] {topic}", f"Headline: {title}"]
-            if snippet:
-                parts.append(snippet)
-            if source:
-                parts.append(f"Source: {source}")
-            alerts.append("\n".join(parts))
-            print(f"[Monitor] 🔔 New headline for '{topic}': {title[:60]}")
+
+            # A changed headline hash says something happened; it does not say
+            # what, or whether it matters. Hermes reads around the story and
+            # writes the briefing -- but only now, once the cheap check has
+            # already proven there is news. Running it on every topic every day
+            # would spend the budget almost entirely on "nothing has changed".
+            briefing = _hermes_briefing(topic, title)
+            if briefing:
+                alerts.append(f"[MONITOR_ALERT] {topic}\n{briefing}")
+                print(f"[Monitor] 🔔 Hermes briefing for '{topic}'")
+            else:
+                parts = [f"[MONITOR_ALERT] {topic}", f"Headline: {title}"]
+                if snippet:
+                    parts.append(snippet)
+                if source:
+                    parts.append(f"Source: {source}")
+                alerts.append("\n".join(parts))
+                print(f"[Monitor] 🔔 New headline for '{topic}': {title[:60]}")
 
         except Exception as e:
             print(f"[Monitor] ⚠️ Check failed for '{topic}': {e}")
@@ -157,3 +168,33 @@ def check_all() -> list[str]:
         _save(monitors)
 
     return alerts
+
+
+def _hermes_briefing(topic: str, headline: str) -> str:
+    """Ask Hermes to explain what actually happened, or "" to fall back.
+
+    Every failure path here is deliberately silent and returns "": Hermes being
+    absent, rate-limited or broken must never cost the user their alert. The
+    headline-and-snippet version is a worse briefing, not a missing one.
+    """
+    try:
+        from actions import hermes_agent
+    except Exception:
+        return ""
+    if not hermes_agent.installed():
+        return ""
+    allowed, _why = hermes_agent.budget_check()
+    if not allowed:
+        return ""
+    try:
+        ok, text = hermes_agent.ask(
+            f"News broke about {topic!r}. The top headline is: {headline!r}. "
+            "Check what actually happened, then tell me in two or three "
+            "sentences what is new and why it matters to someone following "
+            "this. If the headline turns out to be routine or a rehash of old "
+            "news, say exactly that instead.",
+            max_turns=6,
+        )
+    except Exception:
+        return ""
+    return text.strip() if ok and text and text.strip() else ""

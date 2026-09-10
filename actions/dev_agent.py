@@ -4,6 +4,7 @@ import json
 import re
 import time
 from pathlib import Path
+from core import models
 
 
 def get_base_dir():
@@ -16,8 +17,10 @@ BASE_DIR         = get_base_dir()
 API_CONFIG_PATH  = BASE_DIR / "config" / "api_keys.json"
 PROJECTS_DIR     = Path.home() / "Desktop" / "JarvisProjects"
 MAX_FIX_ATTEMPTS = 5
-MODEL_PLANNER    = "gemini-flash-latest"
-MODEL_WRITER     = "gemini-flash-latest"
+# Planning is reasoning about structure; writing is code. Routed apart so
+# each gets the model suited to it. See core/models.py.
+MODEL_PLANNER    = models.for_task("text")
+MODEL_WRITER     = models.for_task("code")
 
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:

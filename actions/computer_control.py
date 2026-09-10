@@ -14,14 +14,14 @@ else:
 import time
 import random
 from pathlib import Path
+from core import models
 
-try:
-    import pyautogui
-    pyautogui.FAILSAFE = True
-    pyautogui.PAUSE    = 0.05
-    _PYAUTOGUI = True
-except ImportError:
-    _PYAUTOGUI = False
+# pyautogui costs ~94 MB on macOS (it pulls pyobjc/Quartz behind it), and
+# most sessions never touch the mouse. The proxy imports it on first use;
+# the flag answers "is it installed?" without importing anything.
+from core.lazy_import import LazyModule, available, _configure_pyautogui
+pyautogui = LazyModule("pyautogui", _configure_pyautogui)
+_PYAUTOGUI = available("pyautogui")
 
 try:
     import pyperclip
@@ -40,10 +40,10 @@ _CONFIG_PATH  = _BASE / "config" / "api_keys.json"
 _MEMORY_PATH  = _BASE / "memory" / "long_term.json"
 
 def _load_config() -> dict:
-    try:
-        return json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    # Shared mtime-keyed cache. _get_api_key() sits in front of every screen
+    # action, so this was an open+parse per click; now it is a stat().
+    # Treat the result as read-only -- it is the cache's own dict.
+    return models.config()
 
 def _platform_os() -> str:
     return {"Windows": "windows", "Darwin": "mac", "Linux": "linux"}.get(
@@ -336,7 +336,7 @@ def _screen_find(description: str) -> tuple[int, int] | None:
         )
 
         response = client.models.generate_content(
-            model="gemini-flash-lite-latest",
+            model=models.for_task("fast"),
             contents=[
                 gtypes.Part.from_bytes(data=image_bytes, mime_type="image/png"),
                 prompt,

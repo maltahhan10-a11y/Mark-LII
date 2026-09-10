@@ -208,6 +208,54 @@ end tell
     return out
 
 
+def append_note(title: str, body: str, folder: str | None = None) -> str:
+    """Add text to the end of an existing note, creating it if there is none.
+
+    A note's body is HTML, not plain text, so the new text goes in its own
+    <div> — concatenating raw text would run it onto the end of the last line
+    and any punctuation that looked like markup would be swallowed.
+    """
+    err = _check_macos()
+    if err:
+        return err
+
+    if not title:
+        return "Which note should I write in?"
+    if not body:
+        return "What should I write in the note?"
+
+    safe_title = _escape_applescript(title)
+    # Escape for HTML as well as AppleScript: the body is injected into markup.
+    html = (
+        body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        .replace("\n", "<br>")
+    )
+    safe_body = _escape_applescript(html)
+
+    script = f'''
+tell application "Notes"
+    set matches to every note whose name is "{safe_title}"
+    if (count of matches) is 0 then
+        return "__NOTFOUND__"
+    end if
+    set theNote to item 1 of matches
+    set body of theNote to (body of theNote) & "<div>{safe_body}</div>"
+    return "Added to note \\"{safe_title}\\"."
+end tell
+'''
+    ok, out = _run_applescript(script)
+    if not ok:
+        return f"Failed to write to note: {out}"
+    if out.strip() == "__NOTFOUND__":
+        # Nothing to append to — make the note instead, which is what the
+        # request meant anyway.
+        created = create_note(title, body, folder)
+        if created.startswith("Failed") or created.startswith("Error"):
+            return created
+        return f"No note called \"{title}\" existed, so I created it with that text."
+    return out
+
+
 def list_folders() -> str:
     err = _check_macos()
     if err:
@@ -251,6 +299,11 @@ def apple_notes(parameters: dict, player=None) -> str:
         return read_note(title=params.get("title", ""))
     elif action == "search_notes":
         return search_notes(query=params.get("query", ""))
+    elif action in ("append_note", "add_to_note", "write_note"):
+        return append_note(
+            params.get("title", ""), params.get("body", ""), params.get("folder")
+        )
+
     elif action == "create_note":
         return create_note(
             title=params.get("title", ""),
@@ -262,5 +315,6 @@ def apple_notes(parameters: dict, player=None) -> str:
     else:
         return (
             f"Unknown apple_notes action: '{action}'. "
-            "Valid actions: list_notes, read_note, search_notes, create_note, list_folders."
+            "Valid actions: list_notes, read_note, search_notes, create_note, "
+            "append_note, list_folders."
         )

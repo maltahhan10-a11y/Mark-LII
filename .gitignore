@@ -1,24 +1,121 @@
 # ── Secrets — never commit ───────────────────────────────────────────────
+.env
+.env.*
+!.env.example
 config/api_keys.json
+config/credentials.json
+config/token*.json
+config/*_token.json
 config/certs/
 *.pem
 *.key
+*.p8
+*.p12
+*.pfx
+*.crt
+*.cer
+*.keystore
+service-account*.json
+client_secret*.json
+
+# Google OAuth: the checked-in file is an empty placeholder. If you fill it
+# in locally, keep it out of the repo.
+config/google_credentials.json
+
+# ── Personal data ────────────────────────────────────────────────────────
+# Enrolled face embeddings — biometric data, stays local.
+config/faces.json
+# Real phone numbers and emails — must never reach the repo.
+config/contacts.json
+config/people.json
+# Conversation history, learned preferences, notes.
+memory/*.json
+memory/*.db
+memory/*.sqlite*
+*.sqlite
+*.sqlite3
+state.db
+
+# Captured media — screenshots, camera frames, call recordings, voice clips.
+screenshots/
+captures/
+recordings/
+call_recordings/
+photos/
+faces/
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.mp4
+*.mov
+*.png
+*.jpg
+*.jpeg
+*.heic
+*.webp
+!config/jarvis.ico
+!tools/jarvis.icns
+!dashboard/static/**/*.png
+!dashboard/static/**/*.svg
+
+# ── Vendored third-party trees, venvs, model weights ─────────────────────
+# vendor/ holds a full Hermes checkout, its private home dir (sessions,
+# memories, logs, state.db), Hunyuan3D, two virtualenvs and ~5.7 GB of
+# weights. None of it belongs in this repo.
+vendor/
+.sidecar/
+blender_bridge/__pycache__/
+config/models/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.onnx
+*.tflite
+*.gguf
+*.task
 
 # ── Python ───────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
+*$py.class
 *.egg-info/
+build/
+dist/
+.eggs/
 .venv/
 venv/
 env/
+ENV/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+.tox/
 
 # ── Runtime state ────────────────────────────────────────────────────────
-memory/*.json
 *.log
+logs/
+pids.json
+*.pid
+tmp/
+.cache/
 
 # ── Editor / OS ──────────────────────────────────────────────────────────
 .vscode/
 .idea/
+*.swp
+*.swo
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
 Thumbs.db
 desktop.ini
 *.bak
+*~

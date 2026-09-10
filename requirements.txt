@@ -11,6 +11,10 @@ pyautogui
 pyperclip
 pygetwindow
 opencv-python
+# Bare-hand gesture control. Pinned <1.0: mediapipe 1.0.x forces the Metal
+# path for hand tracking on macOS and hard-aborts the process
+# ("graph_service.h: Service is unavailable") even with the CPU delegate.
+mediapipe<1.0
 numpy
 mss
 psutil

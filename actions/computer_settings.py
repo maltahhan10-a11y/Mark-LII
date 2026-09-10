@@ -7,13 +7,12 @@ import subprocess
 import platform
 from pathlib import Path
 
-try:
-    import pyautogui
-    pyautogui.FAILSAFE = True
-    pyautogui.PAUSE    = 0.05
-    _PYAUTOGUI = True
-except ImportError:
-    _PYAUTOGUI = False
+# pyautogui costs ~94 MB on macOS (it pulls pyobjc/Quartz behind it), and
+# most sessions never touch the mouse. The proxy imports it on first use;
+# the flag answers "is it installed?" without importing anything.
+from core.lazy_import import LazyModule, available, _configure_pyautogui
+pyautogui = LazyModule("pyautogui", _configure_pyautogui)
+_PYAUTOGUI = available("pyautogui")
 
 try:
     import pyperclip
@@ -121,8 +120,60 @@ def volume_get() -> int | None:
         return None
 
 
+# macOS has no public API for display brightness, and `osascript ... key code
+# 144` needs Accessibility consent and moves in uneven jumps. DisplayServices
+# is private but has been stable for years, reads a real level, and needs no
+# permission — so try it first and keep the key events as the fallback.
+_ds_cache: object = None   # None = untried, False = unavailable, else (lib, id)
+
+
+def _macos_brightness_api():
+    global _ds_cache
+    if _ds_cache is not None:
+        return _ds_cache or None
+    _ds_cache = False
+    if _OS != "Darwin":
+        return None
+    try:
+        import ctypes
+
+        ds = ctypes.cdll.LoadLibrary(
+            "/System/Library/PrivateFrameworks/DisplayServices.framework/"
+            "DisplayServices"
+        )
+        cg = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+        )
+        cg.CGMainDisplayID.restype = ctypes.c_uint32
+        ds.DisplayServicesGetBrightness.argtypes = [
+            ctypes.c_uint32, ctypes.POINTER(ctypes.c_float)
+        ]
+        ds.DisplayServicesGetBrightness.restype = ctypes.c_int
+        ds.DisplayServicesSetBrightness.argtypes = [ctypes.c_uint32, ctypes.c_float]
+        ds.DisplayServicesSetBrightness.restype = ctypes.c_int
+
+        display_id = cg.CGMainDisplayID()
+        probe = ctypes.c_float()
+        if ds.DisplayServicesGetBrightness(display_id, ctypes.byref(probe)) != 0:
+            return None
+        _ds_cache = (ds, display_id, ctypes)
+        return _ds_cache
+    except Exception as exc:
+        print(f"[Settings] macOS brightness API unavailable: {exc}")
+        return None
+
+
 def brightness_get() -> int | None:
     """Current brightness 0-100, or None where it cannot be read."""
+    api = _macos_brightness_api()
+    if api:
+        ds, display_id, ctypes = api
+        try:
+            v = ctypes.c_float()
+            if ds.DisplayServicesGetBrightness(display_id, ctypes.byref(v)) == 0:
+                return max(0, min(100, round(v.value * 100)))
+        except Exception:
+            pass
     try:
         if _OS == "Windows":
             r = subprocess.run(
@@ -148,6 +199,16 @@ def brightness_set(value: int) -> None:
     """Set brightness to an absolute percentage. Only used to restore a value
     captured before a change, so it is undo's counterpart to the up/down pair."""
     value = max(0, min(100, int(value)))
+    api = _macos_brightness_api()
+    if api:
+        ds, display_id, ctypes = api
+        try:
+            if ds.DisplayServicesSetBrightness(
+                display_id, ctypes.c_float(value / 100.0)
+            ) == 0:
+                return
+        except Exception:
+            pass
     if _OS == "Windows":
         subprocess.run(
             ["powershell", "-Command",

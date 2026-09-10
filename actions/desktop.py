@@ -8,12 +8,9 @@ import tempfile
 import platform
 from pathlib import Path
 from datetime import datetime
+from core import models
 
-try:
-    import pyautogui
-    _PYAUTOGUI = True
-except ImportError:
-    _PYAUTOGUI = False
+_PYAUTOGUI = False  # pyautogui is not used in this module
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
@@ -142,7 +139,9 @@ Output ONLY the Python code. No explanation, no markdown, no backticks.
 Task: {task}"""
 
     try:
-        response = _client.models.generate_content(model="gemini-flash-latest", contents=prompt)
+        response = _client.models.generate_content(
+            model=models.for_task("code"), contents=prompt
+        )
         code = response.text.strip()
         if code.startswith("```"):
             lines = code.split("\n")

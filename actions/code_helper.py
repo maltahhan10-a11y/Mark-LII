@@ -4,6 +4,7 @@ import json
 import re
 import time
 from pathlib import Path
+from core import models
 
 
 def get_base_dir():
@@ -15,7 +16,9 @@ BASE_DIR           = get_base_dir()
 API_CONFIG_PATH    = BASE_DIR / "config" / "api_keys.json"
 DESKTOP            = Path.home() / "Desktop"
 MAX_BUILD_ATTEMPTS = 3
-GEMINI_MODEL       = "gemini-flash-latest"
+# Resolved per call rather than pinned, so a config edit takes effect
+# without a restart. See core/models.py.
+GEMINI_MODEL       = models.for_task("code")
 
 
 def _get_api_key() -> str:
@@ -488,7 +491,7 @@ Be specific and actionable. If you see an error message, quote it exactly."""
         ]
 
         response = client.models.generate_content(
-            model="gemini-flash-latest",
+            model=models.for_task("vision"),
             contents=contents,
         )
 
