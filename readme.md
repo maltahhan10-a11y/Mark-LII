@@ -17,6 +17,14 @@ It's not just an assistant — it's an extension of your digital life.
 
 ---
 
+## Command Center Upgrade
+
+The remote dashboard has been rebuilt as a **responsive Command Center** without changing its pairing, encryption, microphone relay, file-transfer, WebSocket, or dashboard API contracts. It now provides an operations-style interface with live connection telemetry, quick missions, voice-channel feedback, a resilient reconnect loop, an accessible mobile layout, and a richer conversation surface. The server now bounds command buffering and command size, preventing an unavailable live session or an accidental rapid-fire client from consuming unbounded memory.
+
+The live audio pipeline now also has bounded queues that discard stale audio under temporary load rather than growing memory use or creating several seconds of conversational lag. The development agent validates model-generated project paths and dependency declarations before writing or installing them, preserving its autonomous build workflow while keeping generated files inside the requested project workspace. Finally, the local LLM text helper now correctly honors the configured OpenAI-compatible backend for agent and coding flows.
+
+---
+
 ## 🚀 Capabilities
 
 ### Core Features

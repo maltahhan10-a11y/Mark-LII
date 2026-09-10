@@ -339,14 +339,47 @@ def call_llm_text(
     Used by planner, executor, error_handler, code_helper, dev_agent.
     """
     url, default_model = get_llm_settings()
-    endpoint = f"{url}/api/chat"
     m        = model or default_model
+    provider = get_llm_provider()
 
     messages: list[dict] = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
+    # This helper used to always call Ollama's /api/chat route, even when an
+    # OpenAI-compatible provider was selected. The other client methods already
+    # supported both backends; matching that behavior keeps planning/code agents
+    # usable with LM Studio, LocalAI, Jan, llama.cpp and vLLM as advertised.
+    if provider == "openai":
+        payload = {
+            "model": m,
+            "messages": messages,
+            "stream": False,
+            "max_tokens": 600,
+        }
+        try:
+            resp = requests.post(
+                f"{url}/v1/chat/completions", json=payload, timeout=timeout
+            )
+            resp.raise_for_status()
+            message = resp.json().get("choices", [{}])[0].get("message", {})
+            return (message.get("content") or "").strip()
+        except requests.exceptions.ConnectionError:
+            raise RuntimeError(
+                f"Cannot connect to the OpenAI-compatible server at {url}. "
+                "Make sure it is running and exposes /v1/chat/completions"
+            )
+        except requests.exceptions.Timeout:
+            raise RuntimeError("OpenAI-compatible text request timed out.")
+        except requests.exceptions.HTTPError as e:
+            raise RuntimeError(
+                f"OpenAI-compatible HTTP error: {e.response.status_code}"
+            )
+        except Exception as e:
+            raise RuntimeError(f"OpenAI-compatible text call failed: {e}")
+
+    endpoint = f"{url}/api/chat"
     payload = {"model": m, "messages": messages, "stream": False, "keep_alive": -1, "options": {"num_predict": 600}}
 
     try:

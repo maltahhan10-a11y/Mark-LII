@@ -31,6 +31,10 @@ except ImportError:
 _UPLOAD_OK = False
 try:
     from fastapi import UploadFile, File as FastAPIFile
+    # Importing FastAPI's annotations succeeds without its multipart parser.
+    # FastAPI validates that dependency when the upload route is registered, so
+    # check it here and keep the rest of the remote dashboard available.
+    import multipart  # noqa: F401
     _UPLOAD_OK = True
 except Exception:
     pass
@@ -39,6 +43,8 @@ BASE_DIR    = Path(__file__).resolve().parent.parent
 STATIC_DIR  = Path(__file__).parent / "static"
 PORT        = 8000
 MAX_UPLOAD_MB = 500
+MAX_COMMAND_CHARS = 8_000
+COMMAND_QUEUE_SIZE = 64
 
 
 def _make_uploads_dir() -> Path:
@@ -65,6 +71,17 @@ def _get_gemini_key() -> str | None:
             return _json.load(f).get("gemini_api_key")
     except Exception:
         return None
+
+
+def _get_assistant_name() -> str:
+    """Read the configurable display name without exposing configuration data."""
+    try:
+        import json as _json
+        with open(BASE_DIR / "config" / "api_keys.json", "r", encoding="utf-8") as f:
+            name = str(_json.load(f).get("assistant_name", "JARVIS")).strip()
+            return name[:48] or "JARVIS"
+    except Exception:
+        return "JARVIS"
 
 _KEY_CHARS = [c for c in (string.ascii_uppercase + string.digits)
               if c not in ('O', 'I', 'L', '0', '1')]
@@ -457,12 +474,16 @@ class DashboardServer:
 
     def __init__(self):
         self._ip                          = _local_ip()
+        self._assistant_name              = _get_assistant_name()
         self._tokens: set[str]            = set()
         self._token_keys: dict[str, str]  = {}   # auth_token → session_key
         self._aes_cache:  dict[str, bytes]= {}   # session_key → AES bytes
         self._clients: set[WebSocket]     = set()
         self._history: list[dict]         = []
-        self._command_queue               = asyncio.Queue()
+        # A remote page must never be able to accumulate unlimited commands while
+        # the Live session is reconnecting. Keeping the queue bounded protects
+        # desktop memory and makes back-pressure visible to the caller.
+        self._command_queue               = asyncio.Queue(maxsize=COMMAND_QUEUE_SIZE)
         self._wake_callback               = None
         self._connect_callback            = None
         self._pending_keys: dict[str, float] = {}
@@ -510,6 +531,17 @@ class DashboardServer:
             return _decrypt_cbc(self._aes_key(sk), enc_b64)
         except Exception:
             return None
+
+    def _queue_command(self, text: str) -> bool:
+        """Validate and enqueue one remote command without blocking the server."""
+        text = (text or "").strip()
+        if not text or len(text) > MAX_COMMAND_CHARS:
+            return False
+        try:
+            self._command_queue.put_nowait(text)
+            return True
+        except asyncio.QueueFull:
+            return False
 
     # ── callbacks ────────────────────────────────────────────────────────
 
@@ -562,7 +594,8 @@ class DashboardServer:
             # don't send custom headers (location.href doesn't carry Authorization).
             html = (self._app_html
                     .replace("__IP__", self._ip)
-                    .replace("__PORT__", str(PORT)))
+                    .replace("__PORT__", str(PORT))
+                    .replace("__ASSISTANT_NAME__", self._assistant_name))
             return HTMLResponse(html)
 
         @app.post("/login")
@@ -678,7 +711,16 @@ class DashboardServer:
             else:
                 text = (body.get("text") or "").strip()
             if text:
-                await self._command_queue.put(text)
+                if len(text) > MAX_COMMAND_CHARS:
+                    return JSONResponse(
+                        {"error": f"Command too long (max {MAX_COMMAND_CHARS} characters)"},
+                        status_code=413,
+                    )
+                if not self._queue_command(text):
+                    return JSONResponse(
+                        {"error": "Command queue is busy — try again in a moment"},
+                        status_code=429,
+                    )
                 if self._wake_callback:
                     self._wake_callback()
             return JSONResponse({"ok": True})
@@ -826,8 +868,7 @@ class DashboardServer:
                     if data.get("type") == "command":
                         enc = data.get("enc", "")
                         t   = self._decrypt(tok, enc) if enc else (data.get("text") or "").strip()
-                        if t:
-                            await self._command_queue.put(t)
+                        if t and self._queue_command(t):
                             if self._wake_callback:
                                 self._wake_callback()
             except WebSocketDisconnect:

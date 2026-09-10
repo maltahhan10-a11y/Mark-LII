@@ -105,6 +105,11 @@ CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
+# These queues hold only a few seconds of audio. They deliberately drop the
+# oldest chunk under load so the assistant stays in real time instead of slowly
+# answering speech from several seconds ago while memory grows without bound.
+PLAYBACK_QUEUE_SIZE = 160
+REALTIME_QUEUE_SIZE = 200
 
 # RMS below which 16-bit PCM is treated as room silence; above _LEVEL_FULL it
 # reads as a full-height waveform. Tuned so ordinary speech lands mid-range and
@@ -1067,6 +1072,32 @@ class JarvisLive:
         elif not self.ui.muted:
             self.ui.set_state("LISTENING")
 
+    @staticmethod
+    def _put_latest(queue: asyncio.Queue | None, item) -> None:
+        """Insert one real-time item, evicting stale data if the queue is full.
+
+        Audio is time-sensitive. Preserving an old frame is less useful than the
+        most recent one, and an unbounded queue turns a temporary network or
+        device slowdown into increasing RAM use and unacceptable latency.
+        """
+        if queue is None:
+            return
+        try:
+            queue.put_nowait(item)
+            return
+        except asyncio.QueueFull:
+            pass
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        try:
+            queue.put_nowait(item)
+        except asyncio.QueueFull:
+            # Another callback consumed/filled the queue between these two
+            # operations; dropping one frame is still preferable to blocking.
+            pass
+
     def interrupt(self) -> None:
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
         self._interrupted = True
@@ -1435,7 +1466,8 @@ class JarvisLive:
             if not jarvis_speaking and not self.ui.muted and not self._phone_active:
                 data = indata.tobytes()
                 loop.call_soon_threadsafe(
-                    self.out_queue.put_nowait,
+                    self._put_latest,
+                    self.out_queue,
                     {"data": data, "mime_type": "audio/pcm"}
                 )
                 # Feed the live mic level to the HUD so the waveform reacts to
@@ -1520,7 +1552,10 @@ class JarvisLive:
                             _audio_data = response.data
                             _SLICE = 2400
                             for _i in range(0, len(_audio_data), _SLICE):
-                                self.audio_in_queue.put_nowait(_audio_data[_i : _i + _SLICE])
+                                self._put_latest(
+                                    self.audio_in_queue,
+                                    _audio_data[_i : _i + _SLICE],
+                                )
 
                     if response.server_content:
                         sc = response.server_content
@@ -1977,10 +2012,7 @@ class JarvisLive:
             with self._speaking_lock:
                 speaking = self._is_speaking
             if not speaking and not self.ui.muted:
-                try:
-                    self.out_queue.put_nowait(chunk)
-                except asyncio.QueueFull:
-                    pass
+                self._put_latest(self.out_queue, chunk)
 
     def _on_phone_connected(self) -> None:
         self.ui.write_log("SYS: Phone connected via Remote Dashboard.")
@@ -2073,8 +2105,8 @@ class JarvisLive:
                     asyncio.TaskGroup() as tg,
                 ):
                     self.session          = session
-                    self.audio_in_queue   = asyncio.Queue()
-                    self.out_queue        = asyncio.Queue(maxsize=200)
+                    self.audio_in_queue   = asyncio.Queue(maxsize=PLAYBACK_QUEUE_SIZE)
+                    self.out_queue        = asyncio.Queue(maxsize=REALTIME_QUEUE_SIZE)
                     self._turn_done_event = asyncio.Event()
 
                     # Reset transient state that must not carry over from a previous session
