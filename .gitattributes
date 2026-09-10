@@ -1,0 +1,22 @@
+# Normalise line endings on the way into the repository. Without this, a tool
+# that writes CRLF rewrites whole files as one indivisible change: Manus's
+# upgrade commit touched 550 lines of actions/dev_agent.py this way, of which
+# exactly three were real.
+* text=auto eol=lf
+
+# Binary — never touch.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.icns binary
+*.mp4 binary
+*.mov binary
+*.wav binary
+*.mp3 binary
+*.safetensors binary
+*.pt binary
+*.pth binary
+*.bin binary
+*.onnx binary
+*.task binary

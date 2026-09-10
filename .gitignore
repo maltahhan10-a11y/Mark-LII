@@ -4,9 +4,14 @@
 !.env.example
 config/api_keys.json
 config/credentials.json
-config/token*.json
-config/*_token.json
 config/certs/
+# A linked WhatsApp session: committing it hands somebody the account itself,
+# not merely a key. Adopted from Mark-LIII, whose own rule for it is inert
+# because git does not support trailing comments on a pattern line.
+config/whatsapp_web/
+# No leading slash, so these match at any depth.
+token*.json
+*_token.json
 *.pem
 *.key
 *.p8
@@ -101,6 +106,7 @@ htmlcov/
 # ── Runtime state ────────────────────────────────────────────────────────
 *.log
 logs/
+downloads/
 pids.json
 *.pid
 tmp/
